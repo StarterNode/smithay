@@ -15,7 +15,7 @@ use smithay::{
             Resource,
         },
     },
-    utils::{Logical, Point, Serial},
+    utils::{Logical, Point, Rectangle, Serial},
     wayland::{
         compositor::{self, with_states},
         seat::WaylandFocus,
@@ -345,7 +345,12 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             .or_else(|| self.space.outputs().next())
             // Assumes that at least one output exists
             .expect("No outputs found");
-        let geometry = self.space.output_geometry(output).unwrap();
+        let geo = self.space.output_geometry(output).unwrap();
+        let geometry = {
+            let map = layer_map_for_output(output);
+            let zone = map.non_exclusive_zone();
+            Rectangle::new(geo.loc + zone.loc, zone.size)
+        };
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);

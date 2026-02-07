@@ -11,8 +11,11 @@ use smithay::{
         },
         Color32F, ImportAll, ImportMem, Renderer,
     },
-    desktop::space::{
-        constrain_space_element, ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements,
+    desktop::{
+        layer_map_for_output,
+        space::{
+            constrain_space_element, ConstrainBehavior, ConstrainReference, Space, SpaceRenderElements,
+        },
     },
     output::Output,
     utils::{Point, Rectangle, Size},
@@ -153,8 +156,10 @@ where
         .and_then(|f| f.get())
     {
         let scale = output.current_scale().fractional_scale().into();
+        let zone = layer_map_for_output(output).non_exclusive_zone();
+        let fullscreen_origin = (zone.loc.x, zone.loc.y).into();
         let window_render_elements: Vec<WindowRenderElement<R>> =
-            AsRenderElements::<R>::render_elements(&window, renderer, (0, 0).into(), scale, 1.0);
+            AsRenderElements::<R>::render_elements(&window, renderer, fullscreen_origin, scale, 1.0);
 
         let elements = custom_elements
             .into_iter()
