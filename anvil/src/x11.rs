@@ -22,7 +22,7 @@ use smithay::{
         },
         egl::{EGLContext, EGLDisplay},
         renderer::{
-            damage::OutputDamageTracker, element::AsRenderElements, gles::GlesRenderer, Bind, ImportDma,
+            damage::OutputDamageTracker, element::AsRenderElements, glow::GlowRenderer, Bind, ImportDma,
             ImportMemWl,
         },
         vulkan::{version::Version, Instance, PhysicalDevice},
@@ -58,9 +58,9 @@ pub const OUTPUT_NAME: &str = "x11";
 pub struct X11Data {
     render: bool,
     mode: Mode,
-    // FIXME: If GlesRenderer is dropped before X11Surface, then the MakeCurrent call inside Gles2Renderer will
+    // FIXME: If GlowRenderer is dropped before X11Surface, then the MakeCurrent call inside the renderer will
     // fail because the X11Surface is keeping gbm alive.
-    renderer: GlesRenderer,
+    renderer: GlowRenderer,
     damage_tracker: OutputDamageTracker,
     surface: X11Surface,
     dmabuf_state: DmabufState,
@@ -176,7 +176,7 @@ pub fn run_x11() {
     };
 
     #[cfg_attr(not(feature = "egl"), allow(unused_mut))]
-    let mut renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
+    let mut renderer = unsafe { GlowRenderer::new(context) }.expect("Failed to initialize renderer");
 
     #[cfg(feature = "egl")]
     if renderer.bind_wl_display(&display.handle()).is_ok() {
@@ -254,7 +254,7 @@ pub fn run_x11() {
     state
         .shm_state
         .update_formats(state.backend_data.renderer.shm_formats());
-    state.space.map_output(&output, (0, 0));
+    state.workspaces.space_mut().map_output(&output, (0, 0));
 
     let output_clone = output.clone();
     event_loop
@@ -274,7 +274,7 @@ pub fn run_x11() {
                 output.delete_mode(output.current_mode().unwrap());
                 output.change_current_state(Some(data.backend_data.mode), None, None, None);
                 output.set_preferred(data.backend_data.mode);
-                crate::shell::fixup_positions(&mut data.space, data.pointer.current_location());
+                crate::shell::fixup_positions(data.workspaces.space_mut(), data.human_pointer.current_location());
 
                 data.backend_data.render = true;
             }
@@ -293,6 +293,58 @@ pub fn run_x11() {
     state.start_xwayland();
 
     info!("Initialization completed, starting the main loop.");
+
+    // Signal systemd that compositor is ready (no-ops if not launched by systemd)
+    if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
+        warn!("Failed to notify systemd: {}", e);
+    }
+
+    // Create AI workspace (workspace 1) + spawn desktop server + Chromium kiosk
+    let ai_ws = state.workspaces.create("ai");
+    info!("Created AI workspace {}", ai_ws);
+
+    // Map export virtual output (1920x1080) to workspace 1 BEFORE Chromium spawn.
+    if let Some(space) = state.workspaces.get_space_mut(ai_ws) {
+        space.map_output(state.export.output(), (0, 0));
+        state.export.set_output_mapped_to(ai_ws);
+        info!("Mapped export output to workspace {}", ai_ws);
+    }
+
+    let ai_socket = state.ensure_workspace_socket(ai_ws);
+
+    // Desktop server — serves the AI desktop HTML page on localhost:9100
+    match std::process::Command::new("/usr/local/bin/desktop").spawn() {
+        Ok(child) => info!("Spawned desktop server (pid {})", child.id()),
+        Err(e) => error!("Failed to spawn desktop server: {}", e),
+    }
+
+    // Chromium kiosk on workspace 1 — loads AI desktop, gives compstr something to export
+    match std::process::Command::new("chromium")
+        .args(&[
+            "--kiosk", "--no-first-run", "--disable-infobars",
+            "--ozone-platform=wayland", "--remote-debugging-port=9222",
+            &format!("--user-data-dir=/tmp/chromium-cockpit-{}", ai_ws),
+            "--app=http://localhost:9100",
+        ])
+        .env("WAYLAND_DISPLAY", &ai_socket)
+        .spawn()
+    {
+        Ok(child) => info!("Spawned Chromium kiosk (pid {}) on workspace {} via {}", child.id(), ai_ws, ai_socket),
+        Err(e) => error!("Failed to spawn Chromium kiosk: {}", e),
+    }
+
+    // Spawn panels — they inherit WAYLAND_DISPLAY from env
+    if let Some(ref socket_name) = state.socket_name {
+        for panel in &["/usr/local/bin/cockpit", "/usr/local/bin/gui/dock"] {
+            match std::process::Command::new(panel)
+                .env("WAYLAND_DISPLAY", socket_name)
+                .spawn()
+            {
+                Ok(child) => info!("Spawned {} (pid {})", panel, child.id()),
+                Err(e) => error!("Failed to spawn {}: {}", panel, e),
+            }
+        }
+    }
 
     let mut pointer_element = PointerElement::default();
 
@@ -333,7 +385,7 @@ pub fn run_x11() {
                 );
             }
 
-            let mut elements: Vec<CustomRenderElements<GlesRenderer>> = Vec::new();
+            let mut elements: Vec<CustomRenderElements<GlowRenderer>> = Vec::new();
 
             // draw the cursor as relevant
             // reset the cursor if the surface is no longer alive
@@ -360,7 +412,7 @@ pub fn run_x11() {
             } else {
                 (0, 0).into()
             };
-            let cursor_pos = state.pointer.current_location();
+            let cursor_pos = state.human_pointer.current_location();
 
             pointer_element.set_status(state.cursor_status.clone());
             elements.extend(
@@ -380,7 +432,7 @@ pub fn run_x11() {
                     .to_physical(scale)
                     .to_i32_round();
                 if icon.surface.alive() {
-                    elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
+                    elements.extend(AsRenderElements::<GlowRenderer>::render_elements(
                         &smithay::desktop::space::SurfaceTree::from_surface(&icon.surface),
                         &mut backend_data.renderer,
                         dnd_icon_pos,
@@ -395,7 +447,7 @@ pub fn run_x11() {
 
             let render_res = render_output(
                 &output,
-                &state.space,
+                state.workspaces.space(),
                 elements,
                 &mut backend_data.renderer,
                 &mut fb,
@@ -420,7 +472,7 @@ pub fn run_x11() {
                     let rendered = render_output_result.damage.is_some();
                     if render_output_result.damage.is_some() {
                         let mut output_presentation_feedback =
-                            take_presentation_feedback(&output, &state.space, &states);
+                            take_presentation_feedback(&output, state.workspaces.space(), &states);
                         output_presentation_feedback.presented(
                             frame_target,
                             output
@@ -479,7 +531,7 @@ pub fn run_x11() {
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
-            state.space.refresh();
+            state.workspaces.space_mut().refresh();
             state.popups.cleanup();
             display_handle.flush_clients().unwrap();
         }

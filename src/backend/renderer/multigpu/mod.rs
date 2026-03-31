@@ -1647,7 +1647,7 @@ impl MultiTexture {
         MultiTexture(internal)
     }
 
-    fn new(size: Size<i32, BufferCoords>, buffer_format: Format) -> MultiTexture {
+    pub fn new(size: Size<i32, BufferCoords>, buffer_format: Format) -> MultiTexture {
         MultiTexture(Arc::new(Mutex::new(MultiTextureInternal {
             textures: HashMap::new(),
             size,
@@ -1699,7 +1699,7 @@ impl MultiTexture {
             })
     }
 
-    fn insert_texture<A: GraphicsApi + 'static>(
+    pub fn insert_texture<A: GraphicsApi + 'static>(
         &mut self,
         render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
         texture: <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,

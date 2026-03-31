@@ -42,11 +42,13 @@ use smithay::{
 
 use crate::{
     state::{AnvilState, Backend},
+    workspace::WorkspaceManager,
     ClientState,
 };
 
 mod element;
 mod grabs;
+pub(crate) mod snap;
 pub(crate) mod ssd;
 #[cfg(feature = "xwayland")]
 mod x11;
@@ -198,8 +200,10 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     });
 
                     if let Some(buffer_offset) = buffer_offset {
-                        let current_loc = self.space.element_location(&window).unwrap();
-                        self.space.map_element(window, current_loc + buffer_offset, false);
+                        if let Some(space) = self.workspaces.space_for_surface_mut(&root) {
+                            let current_loc = space.element_location(&window).unwrap();
+                            space.map_element(window, current_loc + buffer_offset, false);
+                        }
                     }
                 }
             }
@@ -243,7 +247,7 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             });
         }
 
-        ensure_initial_configure(surface, &self.space, &mut self.popups)
+        ensure_initial_configure(surface, &self.workspaces, &mut self.popups)
     }
 }
 
@@ -262,13 +266,13 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
         let output = wl_output
             .as_ref()
             .and_then(Output::from_resource)
-            .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+            .unwrap_or_else(|| self.workspaces.space().outputs().next().unwrap().clone());
         let mut map = layer_map_for_output(&output);
         map.map_layer(&LayerSurface::new(surface, namespace)).unwrap();
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
+        if let Some((mut map, layer)) = self.workspaces.space().outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer = map
                 .layers()
@@ -283,10 +287,7 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
 
 impl<BackendData: Backend> AnvilState<BackendData> {
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {
-        self.space
-            .elements()
-            .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
-            .cloned()
+        self.workspaces.window_for_surface(surface)
     }
 }
 
@@ -296,7 +297,7 @@ pub struct SurfaceData {
     pub resize_state: ResizeState,
 }
 
-fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, popups: &mut PopupManager) {
+fn ensure_initial_configure(surface: &WlSurface, workspaces: &WorkspaceManager<WindowElement>, popups: &mut PopupManager) {
     with_surface_tree_upward(
         surface,
         (),
@@ -309,11 +310,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
         |_, _, _| true,
     );
 
-    if let Some(window) = space
-        .elements()
-        .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
-        .cloned()
-    {
+    if let Some(window) = workspaces.window_for_surface(surface) {
         // send the initial configure if relevant
         #[cfg_attr(not(feature = "xwayland"), allow(irrefutable_let_patterns))]
         if let Some(toplevel) = window.0.toplevel() {
@@ -365,7 +362,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
         return;
     };
 
-    if let Some(output) = space.outputs().find(|o| {
+    if let Some(output) = workspaces.space().outputs().find(|o| {
         let map = layer_map_for_output(o);
         map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
             .is_some()

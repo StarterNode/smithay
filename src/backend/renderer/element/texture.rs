@@ -367,6 +367,11 @@ impl<T: Texture> TextureRenderBuffer<T> {
         }
     }
 
+    /// A reference to the underlying texture
+    pub fn texture(&self) -> &T {
+        &self.texture
+    }
+
     /// Format of the underlying texture
     pub fn format(&self) -> Option<Fourcc> {
         self.texture.format()

@@ -2,6 +2,7 @@ use smithay::{
     backend::renderer::{
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{
+            solid::SolidColorRenderElement,
             surface::WaylandSurfaceRenderElement,
             utils::{
                 ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, RelocateRenderElement,
@@ -33,6 +34,7 @@ smithay::backend::renderer::element::render_elements! {
         R: ImportAll + ImportMem;
     Pointer=PointerRenderElement<R>,
     Surface=WaylandSurfaceRenderElement<R>,
+    SnapPreview=SolidColorRenderElement,
     #[cfg(feature = "debug")]
     // Note: We would like to borrow this element instead, but that would introduce
     // a feature-dependent lifetime, which introduces a lot more feature bounds
@@ -46,6 +48,7 @@ impl<R: Renderer> std::fmt::Debug for CustomRenderElements<R> {
         match self {
             Self::Pointer(arg0) => f.debug_tuple("Pointer").field(arg0).finish(),
             Self::Surface(arg0) => f.debug_tuple("Surface").field(arg0).finish(),
+            Self::SnapPreview(arg0) => f.debug_tuple("SnapPreview").field(arg0).finish(),
             #[cfg(feature = "debug")]
             Self::Fps(arg0) => f.debug_tuple("Fps").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
@@ -82,7 +85,7 @@ pub fn space_preview_elements<'a, R, C>(
 ) -> impl Iterator<Item = C> + 'a
 where
     R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Clone + 'static,
+    R::TextureId: Clone + Send + 'static,
     C: From<CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>> + 'a,
 {
     let constrain_behavior = ConstrainBehavior {
@@ -148,7 +151,7 @@ pub fn output_elements<R>(
 ) -> (Vec<OutputRenderElements<R, WindowRenderElement<R>>>, Color32F)
 where
     R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Clone + 'static,
+    R::TextureId: Clone + Send + 'static,
 {
     if let Some(window) = output
         .user_data()
@@ -207,7 +210,7 @@ pub fn render_output<'a, 'd, R>(
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R::Error>>
 where
     R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Clone + 'static,
+    R::TextureId: Clone + Send + 'static,
 {
     let (elements, clear_color) =
         output_elements(output, space, custom_elements, renderer, show_window_preview);

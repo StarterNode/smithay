@@ -149,6 +149,13 @@ pub struct SeatGlobalData<D: SeatHandler> {
     arc: Arc<SeatRc<D>>,
 }
 
+impl<D: SeatHandler> SeatGlobalData<D> {
+    /// Returns the seat name advertised to clients.
+    pub fn seat_name(&self) -> &str {
+        &self.arc.name
+    }
+}
+
 impl<D: SeatHandler> fmt::Debug for SeatGlobalData<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SeatGlobalData").field("arc", &self.arc).finish()

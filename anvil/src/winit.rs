@@ -18,7 +18,7 @@ use smithay::{
         renderer::{
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::AsRenderElements,
-            gles::GlesRenderer,
+            glow::GlowRenderer,
             ImportDma, ImportMemWl,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
@@ -53,7 +53,7 @@ use crate::{drawing::*, render::*};
 pub const OUTPUT_NAME: &str = "winit";
 
 pub struct WinitData {
-    backend: WinitGraphicsBackend<GlesRenderer>,
+    backend: WinitGraphicsBackend<GlowRenderer>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
     full_redraw: u8,
@@ -99,7 +99,7 @@ pub fn run_winit() {
     let mut display_handle = display.handle();
 
     #[cfg_attr(not(feature = "egl"), allow(unused_mut))]
-    let (mut backend, mut winit) = match winit::init::<GlesRenderer>() {
+    let (mut backend, mut winit) = match winit::init::<GlowRenderer>() {
         Ok(ret) => ret,
         Err(err) => {
             error!("Failed to initialize Winit backend: {}", err);
@@ -204,12 +204,64 @@ pub fn run_winit() {
     state
         .shm_state
         .update_formats(state.backend_data.backend.renderer().shm_formats());
-    state.space.map_output(&output, (0, 0));
+    state.workspaces.space_mut().map_output(&output, (0, 0));
 
     #[cfg(feature = "xwayland")]
     state.start_xwayland();
 
     info!("Initialization completed, starting the main loop.");
+
+    // Signal systemd that compositor is ready (no-ops if not launched by systemd)
+    if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
+        warn!("Failed to notify systemd: {}", e);
+    }
+
+    // Create AI workspace (workspace 1) + spawn desktop server + Chromium kiosk
+    let ai_ws = state.workspaces.create("ai");
+    info!("Created AI workspace {}", ai_ws);
+
+    // Map export virtual output (1920x1080) to workspace 1 BEFORE Chromium spawn.
+    if let Some(space) = state.workspaces.get_space_mut(ai_ws) {
+        space.map_output(state.export.output(), (0, 0));
+        state.export.set_output_mapped_to(ai_ws);
+        info!("Mapped export output to workspace {}", ai_ws);
+    }
+
+    let ai_socket = state.ensure_workspace_socket(ai_ws);
+
+    // Desktop server — serves the AI desktop HTML page on localhost:9100
+    match std::process::Command::new("/usr/local/bin/desktop").spawn() {
+        Ok(child) => info!("Spawned desktop server (pid {})", child.id()),
+        Err(e) => error!("Failed to spawn desktop server: {}", e),
+    }
+
+    // Chromium kiosk on workspace 1 — loads AI desktop, gives compstr something to export
+    match std::process::Command::new("chromium")
+        .args(&[
+            "--kiosk", "--no-first-run", "--disable-infobars",
+            "--ozone-platform=wayland", "--remote-debugging-port=9222",
+            &format!("--user-data-dir=/tmp/chromium-cockpit-{}", ai_ws),
+            "--app=http://localhost:9100",
+        ])
+        .env("WAYLAND_DISPLAY", &ai_socket)
+        .spawn()
+    {
+        Ok(child) => info!("Spawned Chromium kiosk (pid {}) on workspace {} via {}", child.id(), ai_ws, ai_socket),
+        Err(e) => error!("Failed to spawn Chromium kiosk: {}", e),
+    }
+
+    // Spawn panels — they inherit WAYLAND_DISPLAY from env
+    if let Some(ref socket_name) = state.socket_name {
+        for panel in &["/usr/local/bin/cockpit", "/usr/local/bin/gui/dock"] {
+            match std::process::Command::new(panel)
+                .env("WAYLAND_DISPLAY", socket_name)
+                .spawn()
+            {
+                Ok(child) => info!("Spawned {} (pid {})", panel, child.id()),
+                Err(e) => error!("Failed to spawn {}: {}", panel, e),
+            }
+        }
+    }
 
     let mut pointer_element = PointerElement::default();
 
@@ -217,15 +269,15 @@ pub fn run_winit() {
         let status = winit.dispatch_new_events(|event| match event {
             WinitEvent::Resized { size, .. } => {
                 // We only have one output
-                let output = state.space.outputs().next().unwrap().clone();
-                state.space.map_output(&output, (0, 0));
+                let output = state.workspaces.space().outputs().next().unwrap().clone();
+                state.workspaces.space_mut().map_output(&output, (0, 0));
                 let mode = Mode {
                     size,
                     refresh: 60_000,
                 };
                 output.change_current_state(Some(mode), None, None, None);
                 output.set_preferred(mode);
-                crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
+                crate::shell::fixup_positions(state.workspaces.space_mut(), state.human_pointer.current_location());
             }
             WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
             _ => (),
@@ -268,11 +320,12 @@ pub fn run_winit() {
 
             let full_redraw = &mut state.backend_data.full_redraw;
             *full_redraw = full_redraw.saturating_sub(1);
-            let space = &mut state.space;
+            let space = state.workspaces.space_mut();
             let damage_tracker = &mut state.backend_data.damage_tracker;
             let show_window_preview = state.show_window_preview;
 
             let dnd_icon = state.dnd_icon.as_ref();
+            let snap_preview = state.snap_preview.as_ref();
 
             let scale = Scale::from(output.current_scale().fractional_scale());
             let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
@@ -288,7 +341,7 @@ pub fn run_winit() {
             } else {
                 (0, 0).into()
             };
-            let cursor_pos = state.pointer.current_location();
+            let cursor_pos = state.human_pointer.current_location();
 
             #[cfg(feature = "debug")]
             let mut renderdoc = state.renderdoc.as_mut();
@@ -316,7 +369,7 @@ pub fn run_winit() {
                     renderdoc.start_frame_capture(renderer.egl_context().get_context_handle(), window_handle);
                 }
 
-                let mut elements = Vec::<CustomRenderElements<GlesRenderer>>::new();
+                let mut elements = Vec::<CustomRenderElements<GlowRenderer>>::new();
 
                 elements.extend(
                     pointer_element.render_elements(
@@ -335,7 +388,7 @@ pub fn run_winit() {
                         .to_physical(scale)
                         .to_i32_round();
                     if icon.surface.alive() {
-                        elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
+                        elements.extend(AsRenderElements::<GlowRenderer>::render_elements(
                             &smithay::desktop::space::SurfaceTree::from_surface(&icon.surface),
                             renderer,
                             dnd_icon_pos,
@@ -343,6 +396,20 @@ pub fn run_winit() {
                             1.0,
                         ));
                     }
+                }
+
+                // draw snap preview overlay if active
+                if let Some(preview) = snap_preview {
+                    use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Kind};
+                    elements.push(CustomRenderElements::SnapPreview(
+                        SolidColorRenderElement::from_buffer(
+                            &preview.buffer,
+                            preview.rect.loc.to_physical_precise_round(scale),
+                            scale,
+                            preview.opacity,
+                            Kind::Unspecified,
+                        ),
+                    ));
                 }
 
                 #[cfg(feature = "debug")]
@@ -398,7 +465,7 @@ pub fn run_winit() {
                     let states = render_output_result.states;
                     if has_rendered {
                         let mut output_presentation_feedback =
-                            take_presentation_feedback(&output, &state.space, &states);
+                            take_presentation_feedback(&output, state.workspaces.space(), &states);
                         output_presentation_feedback.presented(
                             frame_target,
                             output
@@ -445,7 +512,7 @@ pub fn run_winit() {
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
-            state.space.refresh();
+            state.workspaces.space_mut().refresh();
             state.popups.cleanup();
             display_handle.flush_clients().unwrap();
         }

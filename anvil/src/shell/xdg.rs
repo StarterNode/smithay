@@ -31,11 +31,13 @@ use crate::{
     focus::KeyboardFocusTarget,
     shell::{TouchMoveSurfaceGrab, TouchResizeSurfaceGrab},
     state::{AnvilState, Backend},
+    ClientState,
 };
 
 use super::{
-    fullscreen_output_geometry, place_new_window, FullscreenSurface, PointerMoveSurfaceGrab,
-    PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState, SurfaceData, WindowElement,
+    fullscreen_output_geometry, place_new_window, ssd::HEADER_BAR_HEIGHT, FullscreenSurface,
+    PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeEdge, ResizeState, SurfaceData,
+    WindowElement,
 };
 
 impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
@@ -48,10 +50,51 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         // of a xdg_surface has to be sent during the commit if
         // the surface is not already configured
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
-        place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+
+        // Route window to the correct workspace based on client's workspace_id
+        let workspace_id = surface.wl_surface().client()
+            .and_then(|client| {
+                let state = client.get_data::<ClientState>()?;
+                *state.workspace_id.lock().unwrap()
+            });
+
+        let ws_id = workspace_id.unwrap_or(0);
+        let space = match workspace_id.and_then(|id| self.workspaces.get_space_mut(id)) {
+            Some(space) => space,
+            None => self.workspaces.space_mut(),
+        };
+        if ws_id > 0 {
+            // AI workspace: auto-maximize at output origin.
+            // Configure client to fill the virtual output exactly (minus SSD header).
+            // Element placed at output origin so header + content = output height.
+            // Extract geometry from immutable borrow first, then mutate.
+            let maximize_geo = space.outputs().next()
+                .and_then(|o| {
+                    let geo = space.output_geometry(o)?;
+                    let zone = layer_map_for_output(o).non_exclusive_zone();
+                    Some(Rectangle::new(geo.loc + zone.loc, zone.size))
+                });
+
+            if let Some(geometry) = maximize_geo {
+                // Fullscreen: no SSD, full output size, Chromium --kiosk engages
+                surface.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                    state.size = Some(geometry.size);
+                });
+                window.set_ssd(false);
+                space.map_element(window.clone(), geometry.loc, true);
+            } else {
+                space.map_element(window.clone(), Point::default(), true);
+            }
+        } else {
+            place_new_window(space, self.human_pointer.current_location(), &window, true);
+        }
 
         compositor::add_post_commit_hook(surface.wl_surface(), |state: &mut Self, _, surface| {
-            handle_toplevel_commit(&mut state.space, surface);
+            // Search all workspaces for the window
+            if let Some(space) = state.workspaces.space_for_surface_mut(surface) {
+                handle_toplevel_commit(space, surface);
+            }
         });
     }
 
@@ -116,7 +159,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                     return;
                 }
                 let geometry = window.geometry();
-                let loc = self.space.element_location(&window).unwrap();
+                let loc = self.workspaces.space().element_location(&window).unwrap();
                 let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
                 with_states(surface.wl_surface(), move |states| {
@@ -139,6 +182,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                     initial_window_location,
                     initial_window_size,
                     last_window_size: initial_window_size,
+                    ssd_height_offset: 0,
                 };
 
                 touch.set_grab(self, grab, serial);
@@ -170,7 +214,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         }
 
         let geometry = window.geometry();
-        let loc = self.space.element_location(&window).unwrap();
+        let loc = self.workspaces.space().element_location(&window).unwrap();
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
         with_states(surface.wl_surface(), move |states| {
@@ -193,6 +237,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             initial_window_location,
             initial_window_size,
             last_window_size: initial_window_size,
+            ssd_height_offset: 0,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -246,16 +291,26 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             }
 
             let window = self
-                .space
+                .workspaces.space()
                 .elements()
                 .find(|element| element.wl_surface().as_deref() == Some(&surface));
             if let Some(window) = window {
                 use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-                let is_ssd = configure
+                // Suppress SSD for fullscreen windows — ack_configure fires on every
+                // configure, so without this check SSD would re-enable during fullscreen
+                let is_fullscreen = configure
                     .state
-                    .decoration_mode
-                    .map(|mode| mode == Mode::ServerSide)
-                    .unwrap_or(false);
+                    .states
+                    .contains(xdg_toplevel::State::Fullscreen);
+                let is_ssd = if is_fullscreen {
+                    false
+                } else {
+                    configure
+                        .state
+                        .decoration_mode
+                        .map(|mode| mode == Mode::ServerSide)
+                        .unwrap_or(true)
+                };
                 window.set_ssd(is_ssd);
             }
         }
@@ -267,13 +322,24 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         // independently from its buffer size
         let wl_surface = surface.wl_surface();
 
-        let output_geometry = fullscreen_output_geometry(wl_surface, wl_output.as_ref(), &mut self.space);
+        // Find which workspace contains this surface, then operate on that space
+        let ws_id = self.workspaces.workspace_id_for_surface(wl_surface);
+        let space = match ws_id.and_then(|id| self.workspaces.get_space_mut(id)) {
+            Some(space) => space,
+            None => self.workspaces.space_mut(),
+        };
+
+        let output_geometry = fullscreen_output_geometry(wl_surface, wl_output.as_ref(), space);
 
         if let Some(geometry) = output_geometry {
+            let space = match ws_id.and_then(|id| self.workspaces.get_space(id)) {
+                Some(space) => space,
+                None => self.workspaces.space(),
+            };
             let output = wl_output
                 .as_ref()
                 .and_then(Output::from_resource)
-                .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+                .unwrap_or_else(|| space.outputs().next().unwrap().clone());
             let client = match self.display_handle.get_client(wl_surface.id()) {
                 Ok(client) => client,
                 Err(_) => return,
@@ -281,13 +347,13 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             for output in output.client_outputs(&client) {
                 wl_output = Some(output);
             }
-            let window = self
-                .space
-                .elements()
-                .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
-                .unwrap();
+            let window = self.workspaces.window_for_surface(wl_surface).unwrap();
+
+            // Suppress SSD for fullscreen windows — no decorations in fullscreen
+            window.set_ssd(false);
 
             surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Maximized);
                 state.states.set(xdg_toplevel::State::Fullscreen);
                 state.size = Some(geometry.size);
                 state.fullscreen_output = wl_output;
@@ -299,6 +365,13 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 .unwrap()
                 .set(window.clone());
             trace!("Fullscreening: {:?}", window);
+
+            // Reposition element to fullscreen geometry origin — same pattern as maximize_request
+            let space = match ws_id.and_then(|id| self.workspaces.get_space_mut(id)) {
+                Some(space) => space,
+                None => self.workspaces.space_mut(),
+            };
+            space.map_element(window, geometry.loc, true);
         }
 
         // The protocol demands us to always reply with a configure,
@@ -337,26 +410,52 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         // NOTE: This should use layer-shell when it is implemented to
         // get the correct maximum size
-        let window = self.window_for_surface(surface.wl_surface()).unwrap();
-        let outputs_for_window = self.space.outputs_for_element(&window);
-        let output = outputs_for_window
+        // Crash fix bug 2: replace unwrap/expect with safe early returns
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            tracing::warn!("maximize_request: window not found in space, ignoring");
+            return;
+        };
+        let ws_id = self.workspaces.workspace_id_for_surface(surface.wl_surface());
+        let space = match ws_id.and_then(|id| self.workspaces.get_space(id)) {
+            Some(space) => space,
+            None => self.workspaces.space(),
+        };
+        let outputs_for_window = space.outputs_for_element(&window);
+        let Some(output) = outputs_for_window
             .first()
-            // The window hasn't been mapped yet, use the primary output instead
-            .or_else(|| self.space.outputs().next())
-            // Assumes that at least one output exists
-            .expect("No outputs found");
-        let geo = self.space.output_geometry(output).unwrap();
+            .or_else(|| space.outputs().next())
+        else {
+            tracing::warn!("maximize_request: no outputs found, ignoring");
+            return;
+        };
+        let Some(geo) = space.output_geometry(output) else {
+            tracing::warn!("maximize_request: output has no geometry, ignoring");
+            return;
+        };
         let geometry = {
             let map = layer_map_for_output(output);
             let zone = map.non_exclusive_zone();
             Rectangle::new(geo.loc + zone.loc, zone.size)
         };
 
+        // For SSD windows, subtract decoration height from the client size
+        // so that title_bar + client = usable zone height.
+        let is_ssd = window.decoration_state().is_ssd;
+        let client_size = if is_ssd {
+            (geometry.size.w, geometry.size.h - HEADER_BAR_HEIGHT).into()
+        } else {
+            geometry.size
+        };
+
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(geometry.size);
+            state.size = Some(client_size);
         });
-        self.space.map_element(window, geometry.loc, true);
+        let space = match ws_id.and_then(|id| self.workspaces.get_space_mut(id)) {
+            Some(space) => space,
+            None => self.workspaces.space_mut(),
+        };
+        space.map_element(window, geometry.loc, true);
 
         // The protocol demands us to always reply with a configure,
         // regardless of we fulfilled the request or not
@@ -386,13 +485,13 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         let seat: Seat<AnvilState<BackendData>> = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface);
         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
-            self.space
+            self.workspaces.space()
                 .elements()
                 .find(|w| w.wl_surface().map(|s| *s == root).unwrap_or(false))
                 .cloned()
                 .map(KeyboardFocusTarget::from)
                 .or_else(|| {
-                    self.space
+                    self.workspaces.space()
                         .outputs()
                         .find_map(|o| {
                             let map = layer_map_for_output(o);
@@ -434,10 +533,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     pub fn move_request_xdg(&mut self, surface: &ToplevelSurface, seat: &Seat<Self>, serial: Serial) {
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {
-                let start_data = touch.grab_start_data().unwrap();
+                // Crash fix bug 3: replace unwrap with safe early returns
+                let Some(start_data) = touch.grab_start_data() else {
+                    return;
+                };
 
-                // If the client disconnects after requesting a move
-                // we can just ignore the request
                 let Some(window) = self.window_for_surface(surface.wl_surface()) else {
                     return;
                 };
@@ -454,7 +554,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     return;
                 }
 
-                let mut initial_window_location = self.space.element_location(&window).unwrap();
+                let Some(mut initial_window_location) = self.workspaces.space().element_location(&window) else {
+                    return;
+                };
 
                 // If surface is maximized then unmaximize it
                 let changed = surface.with_pending_state(|state| {
@@ -493,14 +595,19 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
+        // Crash fix bug 3: replace unwrap with safe early returns
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
         // Check that this surface has a click grab.
         if !pointer.has_grab(serial) {
             return;
         }
 
-        let start_data = pointer.grab_start_data().unwrap();
+        let Some(start_data) = pointer.grab_start_data() else {
+            return;
+        };
 
         // If the client disconnects after requesting a move
         // we can just ignore the request
@@ -520,7 +627,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         }
 
-        let mut initial_window_location = self.space.element_location(&window).unwrap();
+        let Some(mut initial_window_location) = self.workspaces.space().element_location(&window) else {
+            return;
+        };
 
         // If surface is maximized then unmaximize it
         let changed = surface.with_pending_state(|state| {
@@ -558,6 +667,65 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
+    /// Compositor-initiated resize from SSD border/corner zones.
+    pub fn resize_request_ssd(
+        &mut self,
+        window: &WindowElement,
+        seat: &Seat<Self>,
+        serial: Serial,
+        edges: ResizeEdge,
+    ) {
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+
+        if !pointer.has_grab(serial) {
+            return;
+        }
+
+        let Some(start_data) = pointer.grab_start_data() else {
+            return;
+        };
+
+        // Use full geometry (including SSD) for initial_window_size so that
+        // the position adjustment in the grab's release handler is consistent
+        // with window.geometry() which also includes SSD.
+        let geometry = window.geometry();
+        let Some(initial_window_location) = self.workspaces.space().element_location(window) else {
+            return;
+        };
+        let initial_window_size = geometry.size;
+
+        // ssd_height_offset: the grab subtracts this from configure sizes
+        // so the client receives client-only dimensions.
+        let ssd_height_offset = super::ssd::HEADER_BAR_HEIGHT;
+
+        // Set resize state on the surface
+        if let Some(surface) = window.wl_surface() {
+            with_states(&surface, |states| {
+                if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                    data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                        edges,
+                        initial_window_location,
+                        initial_window_size,
+                    });
+                }
+            });
+        }
+
+        let grab = PointerResizeSurfaceGrab {
+            start_data,
+            window: window.clone(),
+            edges,
+            initial_window_location,
+            initial_window_size,
+            last_window_size: initial_window_size,
+            ssd_height_offset,
+        };
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+    }
+
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
@@ -566,21 +734,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         };
 
-        let mut outputs_for_window = self.space.outputs_for_element(&window);
+        let mut outputs_for_window = self.workspaces.space().outputs_for_element(&window);
         if outputs_for_window.is_empty() {
             return;
         }
 
         // Get a union of all outputs' geometries.
         let mut outputs_geo = self
-            .space
+            .workspaces.space()
             .output_geometry(&outputs_for_window.pop().unwrap())
             .unwrap();
         for output in outputs_for_window {
-            outputs_geo = outputs_geo.merge(self.space.output_geometry(&output).unwrap());
+            outputs_geo = outputs_geo.merge(self.workspaces.space().output_geometry(&output).unwrap());
         }
 
-        let window_geo = self.space.element_geometry(&window).unwrap();
+        let window_geo = self.workspaces.space().element_geometry(&window).unwrap();
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.

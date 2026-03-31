@@ -18,7 +18,7 @@ use smithay::{
 #[cfg(feature = "xwayland")]
 use smithay::{utils::Rectangle, xwayland::xwm::ResizeEdge as X11ResizeEdge};
 
-use super::{SurfaceData, WindowElement};
+use super::{snap, SurfaceData, WindowElement};
 use crate::{
     focus::PointerFocusTarget,
     state::{AnvilState, Backend},
@@ -44,8 +44,33 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
 
-        data.space
+        data.workspaces.space_mut()
             .map_element(self.window.clone(), new_location.to_i32_round(), true);
+
+        // Snap zone detection
+        let trigger_distance = data.decoration_theme.snap_preview.trigger_distance;
+        let output = data.workspaces.space().output_under(event.location).next().cloned();
+        if let Some(output) = output {
+            if let Some(output_geo) = data.workspaces.space().output_geometry(&output) {
+                let usable = snap::usable_area(&output, output_geo);
+                if let Some(zone) = snap::detect_snap_zone(event.location, usable, trigger_distance) {
+                    // Only update if zone changed
+                    let should_update = data
+                        .snap_preview
+                        .as_ref()
+                        .map(|p| p.zone != zone)
+                        .unwrap_or(true);
+                    if should_update {
+                        data.snap_preview =
+                            Some(snap::SnapPreview::new(zone, usable, &data.decoration_theme));
+                    }
+                } else {
+                    data.snap_preview = None;
+                }
+            }
+        } else {
+            data.snap_preview = None;
+        }
     }
 
     fn relative_motion(
@@ -66,6 +91,31 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     ) {
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
+            // Apply snap zone if active
+            if let Some(preview) = data.snap_preview.take() {
+                let is_ssd = self.window.decoration_state().is_ssd;
+                let (client_w, client_h) = snap::snap_client_size(preview.rect, is_ssd);
+
+                match self.window.0.underlying_surface() {
+                    WindowSurface::Wayland(xdg) => {
+                        xdg.with_pending_state(|state| {
+                            state.size = Some((client_w, client_h).into());
+                        });
+                        xdg.send_pending_configure();
+                    }
+                    #[cfg(feature = "xwayland")]
+                    WindowSurface::X11(x11) => {
+                        let _ = x11.configure(Rectangle::new(
+                            preview.rect.loc,
+                            (client_w, client_h).into(),
+                        ));
+                    }
+                }
+
+                data.workspaces.space_mut()
+                    .map_element(self.window.clone(), preview.rect.loc, true);
+            }
+
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
@@ -164,7 +214,9 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
+    fn unset(&mut self, data: &mut AnvilState<BackendData>) {
+        data.snap_preview = None;
+    }
 }
 
 pub struct TouchMoveSurfaceGrab<BackendData: Backend + 'static> {
@@ -219,7 +271,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        data.space
+        data.workspaces.space_mut()
             .map_element(self.window.clone(), new_location.to_i32_round(), true);
     }
 
@@ -346,6 +398,9 @@ pub struct PointerResizeSurfaceGrab<BackendData: Backend + 'static> {
     pub initial_window_location: Point<i32, Logical>,
     pub initial_window_size: Size<i32, Logical>,
     pub last_window_size: Size<i32, Logical>,
+    /// Height offset to subtract from configure size for SSD windows.
+    /// Set to HEADER_BAR_HEIGHT for SSD compositor-initiated resize, 0 otherwise.
+    pub ssd_height_offset: i32,
 }
 
 impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResizeSurfaceGrab<BackendData> {
@@ -409,18 +464,26 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
 
         self.last_window_size = (new_window_width, new_window_height).into();
 
+        // For SSD windows, subtract header height so the client receives
+        // the correct client-only size in configure events.
+        let configure_size: Size<i32, Logical> = (
+            self.last_window_size.w,
+            self.last_window_size.h - self.ssd_height_offset,
+        )
+            .into();
+
         match &self.window.0.underlying_surface() {
             WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
+                    state.size = Some(configure_size);
                 });
                 xdg.send_pending_configure();
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let location = data.space.element_location(&self.window).unwrap();
-                x11.configure(Rectangle::new(location, self.last_window_size))
+                let location = data.workspaces.space().element_location(&self.window).unwrap();
+                x11.configure(Rectangle::new(location, configure_size))
                     .unwrap();
             }
         }
@@ -452,16 +515,22 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                 return;
             }
 
+            let configure_size: Size<i32, Logical> = (
+                self.last_window_size.w,
+                self.last_window_size.h - self.ssd_height_offset,
+            )
+                .into();
+
             match &self.window.0.underlying_surface() {
                 WindowSurface::Wayland(xdg) => {
                     xdg.with_pending_state(|state| {
                         state.states.unset(xdg_toplevel::State::Resizing);
-                        state.size = Some(self.last_window_size);
+                        state.size = Some(configure_size);
                     });
                     xdg.send_pending_configure();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.geometry();
-                        let mut location = data.space.element_location(&self.window).unwrap();
+                        let mut location = data.workspaces.space().element_location(&self.window).unwrap();
 
                         if self.edges.intersects(ResizeEdge::LEFT) {
                             location.x = self.initial_window_location.x
@@ -472,7 +541,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                                 + (self.initial_window_size.h - geometry.size.h);
                         }
 
-                        data.space.map_element(self.window.clone(), location, true);
+                        data.workspaces.space_mut().map_element(self.window.clone(), location, true);
                     }
 
                     with_states(&self.window.wl_surface().unwrap(), |states| {
@@ -490,7 +559,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                 }
                 #[cfg(feature = "xwayland")]
                 WindowSurface::X11(x11) => {
-                    let mut location = data.space.element_location(&self.window).unwrap();
+                    let mut location = data.workspaces.space().element_location(&self.window).unwrap();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.geometry();
 
@@ -503,9 +572,9 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                                 + (self.initial_window_size.h - geometry.size.h);
                         }
 
-                        data.space.map_element(self.window.clone(), location, true);
+                        data.workspaces.space_mut().map_element(self.window.clone(), location, true);
                     }
-                    x11.configure(Rectangle::new(location, self.last_window_size))
+                    x11.configure(Rectangle::new(location, configure_size))
                         .unwrap();
 
                     let Some(surface) = self.window.wl_surface() else {
@@ -632,6 +701,8 @@ pub struct TouchResizeSurfaceGrab<BackendData: Backend + 'static> {
     pub initial_window_location: Point<i32, Logical>,
     pub initial_window_size: Size<i32, Logical>,
     pub last_window_size: Size<i32, Logical>,
+    /// Height offset to subtract from configure size for SSD windows.
+    pub ssd_height_offset: i32,
 }
 
 impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSurfaceGrab<BackendData> {
@@ -665,16 +736,22 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
             return;
         }
 
+        let configure_size: Size<i32, Logical> = (
+            self.last_window_size.w,
+            self.last_window_size.h - self.ssd_height_offset,
+        )
+            .into();
+
         match self.window.0.underlying_surface() {
             WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
+                    state.size = Some(configure_size);
                 });
                 xdg.send_pending_configure();
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                     let geometry = self.window.geometry();
-                    let mut location = data.space.element_location(&self.window).unwrap();
+                    let mut location = data.workspaces.space().element_location(&self.window).unwrap();
 
                     if self.edges.intersects(ResizeEdge::LEFT) {
                         location.x =
@@ -685,7 +762,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
                             self.initial_window_location.y + (self.initial_window_size.h - geometry.size.h);
                     }
 
-                    data.space.map_element(self.window.clone(), location, true);
+                    data.workspaces.space_mut().map_element(self.window.clone(), location, true);
                 }
 
                 with_states(&self.window.wl_surface().unwrap(), |states| {
@@ -703,7 +780,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let mut location = data.space.element_location(&self.window).unwrap();
+                let mut location = data.workspaces.space().element_location(&self.window).unwrap();
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                     let geometry = self.window.geometry();
 
@@ -716,9 +793,9 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
                             self.initial_window_location.y + (self.initial_window_size.h - geometry.size.h);
                     }
 
-                    data.space.map_element(self.window.clone(), location, true);
+                    data.workspaces.space_mut().map_element(self.window.clone(), location, true);
                 }
-                x11.configure(Rectangle::new(location, self.last_window_size))
+                x11.configure(Rectangle::new(location, configure_size))
                     .unwrap();
 
                 let Some(surface) = self.window.wl_surface() else {
@@ -806,18 +883,24 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
 
         self.last_window_size = (new_window_width, new_window_height).into();
 
+        let configure_size: Size<i32, Logical> = (
+            self.last_window_size.w,
+            self.last_window_size.h - self.ssd_height_offset,
+        )
+            .into();
+
         match self.window.0.underlying_surface() {
             WindowSurface::Wayland(xdg) => {
                 xdg.with_pending_state(|state| {
                     state.states.set(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
+                    state.size = Some(configure_size);
                 });
                 xdg.send_pending_configure();
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let location = data.space.element_location(&self.window).unwrap();
-                x11.configure(Rectangle::new(location, self.last_window_size))
+                let location = data.workspaces.space().element_location(&self.window).unwrap();
+                x11.configure(Rectangle::new(location, configure_size))
                     .unwrap();
             }
         }

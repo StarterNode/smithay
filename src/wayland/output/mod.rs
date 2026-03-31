@@ -107,7 +107,8 @@ pub struct OutputManagerState {
 /// Internal data of a wl_output global
 #[derive(Debug)]
 pub struct WlOutputData {
-    output: Output,
+    /// The output this global represents.
+    pub output: Output,
 }
 
 /// Events initiated by the clients interacting with outputs

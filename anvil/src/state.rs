@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use compstr::ipc::IpcHandler;
 use tracing::{info, warn};
 
 use smithay::{
@@ -16,9 +17,10 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_data_control, delegate_data_device, delegate_fixes,
-    delegate_fractional_scale, delegate_input_method_manager, delegate_keyboard_shortcuts_inhibit,
-    delegate_layer_shell, delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
-    delegate_presentation, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
+    delegate_fractional_scale, delegate_input_method_manager, delegate_kde_decoration,
+    delegate_keyboard_shortcuts_inhibit,
+    delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
+    delegate_presentation, delegate_primary_selection, delegate_relative_pointer,
     delegate_security_context, delegate_shm, delegate_tablet_manager, delegate_text_input_manager,
     delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration,
     delegate_xdg_shell,
@@ -44,8 +46,15 @@ use smithay::{
         },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::wl_surface::WlSurface,
-            Client, Display, DisplayHandle, Resource,
+            delegate_dispatch,
+            protocol::{
+                wl_keyboard::WlKeyboard,
+                wl_pointer::WlPointer,
+                wl_seat::WlSeat,
+                wl_surface::WlSurface,
+                wl_touch::WlTouch,
+            },
+            Client, DataInit, Display, DisplayHandle, GlobalDispatch, New, Resource,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial, Time},
@@ -72,7 +81,7 @@ use smithay::{
         pointer_gestures::PointerGesturesState,
         presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
-        seat::WaylandFocus,
+        seat::{KeyboardUserData, PointerUserData, SeatGlobalData, SeatUserData, TouchUserData, WaylandFocus},
         security_context::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource, SecurityContextState,
         },
@@ -83,6 +92,7 @@ use smithay::{
             SelectionHandler,
         },
         shell::{
+            kde::decoration::{KdeDecorationHandler, KdeDecorationState},
             wlr_layer::WlrLayerShellState,
             xdg::{
                 decoration::{XdgDecorationHandler, XdgDecorationState},
@@ -107,7 +117,7 @@ use smithay::{
 use crate::cursor::Cursor;
 use crate::{
     focus::{KeyboardFocusTarget, PointerFocusTarget},
-    shell::WindowElement,
+    shell::{snap::SnapPreview, ssd::DecorationTheme, WindowElement},
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
@@ -123,6 +133,10 @@ use smithay::{
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub security_context: Option<SecurityContext>,
+    /// Workspace this client belongs to. None = desktop (workspace 0).
+    /// Some(id) = AI workspace. Set at connection time via workspace-specific socket.
+    /// Interior mutability via Mutex because ClientState is behind Arc.
+    pub workspace_id: std::sync::Mutex<Option<crate::workspace::WorkspaceId>>,
 }
 impl ClientData for ClientState {
     /// Notification that a client was initialized
@@ -140,7 +154,10 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub handle: LoopHandle<'static, AnvilState<BackendData>>,
 
     // desktop
-    pub space: Space<WindowElement>,
+    pub workspaces: crate::workspace::WorkspaceManager<crate::shell::WindowElement>,
+    pub mirror: crate::workspace::MirrorState,
+    pub export: crate::workspace::ExportState,
+    pub cockpit_socket: compstr::socket::CockpitSocket,
     pub popups: PopupManager,
 
     // smithay state
@@ -156,6 +173,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub viewporter_state: ViewporterState,
     pub xdg_activation_state: XdgActivationState,
     pub xdg_decoration_state: XdgDecorationState,
+    pub kde_decoration_state: KdeDecorationState,
     pub xdg_shell_state: XdgShellState,
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
@@ -174,10 +192,16 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
     pub cursor_status: CursorImageStatus,
-    pub seat_name: String,
-    pub seat: Seat<AnvilState<BackendData>>,
+    pub ai_cursor_status: CursorImageStatus,
+    pub human_seat_name: String,
+    pub human_seat: Seat<AnvilState<BackendData>>,
     pub clock: Clock<Monotonic>,
-    pub pointer: PointerHandle<AnvilState<BackendData>>,
+    pub human_pointer: PointerHandle<AnvilState<BackendData>>,
+    pub ai_seat: Seat<AnvilState<BackendData>>,
+    pub ai_pointer: PointerHandle<AnvilState<BackendData>>,
+    /// Copilot mode — when set, physical input routes to ai_seat for direct
+    /// human control of AI workspace. None = normal (human_seat). Some(id) = copilot.
+    pub copilot_mode: Option<crate::workspace::WorkspaceId>,
 
     #[cfg(feature = "xwayland")]
     pub xwm: Option<X11Wm>,
@@ -188,6 +212,11 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub renderdoc: Option<renderdoc::RenderDoc<renderdoc::V141>>,
 
     pub show_window_preview: bool,
+    pub decoration_theme: DecorationTheme,
+    pub snap_preview: Option<SnapPreview>,
+
+    // IPC — workspace-specific Wayland sockets for client tagging
+    pub workspace_sockets: HashMap<crate::workspace::WorkspaceId, String>,
 }
 
 #[derive(Debug)]
@@ -256,7 +285,70 @@ impl<BackendData: Backend> DndGrabHandler for AnvilState<BackendData> {
 delegate_data_device!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 impl<BackendData: Backend> OutputHandler for AnvilState<BackendData> {}
-delegate_output!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+// Manual output dispatch — replaces delegate_output! to override can_view().
+// Workspace N clients see only the virtual "AI-Desktop" output.
+// Workspace 0 (desktop) clients see only the physical output.
+const _: () = {
+    use smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::{
+        zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
+    };
+    use smithay::reexports::wayland_server::{
+        delegate_dispatch, delegate_global_dispatch, protocol::wl_output::WlOutput, Client,
+        DataInit, DisplayHandle, GlobalDispatch, New,
+    };
+    use smithay::wayland::output::{
+        OutputManagerState, OutputUserData, WlOutputData, XdgOutputUserData,
+    };
+
+    // 1. GlobalDispatch<WlOutput> — custom can_view for output isolation
+    impl<BackendData: Backend + 'static> GlobalDispatch<WlOutput, WlOutputData>
+        for AnvilState<BackendData>
+    {
+        fn bind(
+            state: &mut Self,
+            dh: &DisplayHandle,
+            client: &Client,
+            resource: New<WlOutput>,
+            global_data: &WlOutputData,
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            <OutputManagerState as GlobalDispatch<WlOutput, WlOutputData, Self>>::bind(
+                state, dh, client, resource, global_data, data_init,
+            )
+        }
+
+        fn can_view(client: Client, global_data: &WlOutputData) -> bool {
+            let output_name = global_data.output.name();
+            let is_virtual = output_name == "AI-Desktop";
+            let client_ws = client
+                .get_data::<ClientState>()
+                .and_then(|cs| cs.workspace_id.lock().ok().and_then(|g| *g));
+
+            let result = match (is_virtual, client_ws) {
+                // Virtual output — only visible to workspace N clients (id > 0)
+                (true, Some(id)) if id > 0 => true,
+                (true, _) => false,
+                // Physical output — only visible to desktop clients (workspace 0 / None)
+                (false, None) | (false, Some(0)) => true,
+                (false, _) => false,
+            };
+
+            tracing::info!(
+                "can_view: output={}, is_virtual={}, client_ws={:?}, result={}",
+                output_name, is_virtual, client_ws, result,
+            );
+
+            result
+        }
+    }
+
+    // 2-5. Remaining dispatches — delegate as before
+    delegate_global_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [ZxdgOutputManagerV1: ()] => OutputManagerState);
+    delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [WlOutput: OutputUserData] => OutputManagerState);
+    delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [ZxdgOutputV1: XdgOutputUserData] => OutputManagerState);
+    delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [ZxdgOutputManagerV1: ()] => OutputManagerState);
+};
 
 impl<BackendData: Backend> SelectionHandler for AnvilState<BackendData> {
     type SelectionUserData = ();
@@ -327,15 +419,48 @@ impl<BackendData: Backend> SeatHandler for AnvilState<BackendData> {
         set_data_device_focus(dh, seat, focus.clone());
         set_primary_focus(dh, seat, focus);
     }
-    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        self.cursor_status = image;
+    fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) {
+        if *seat == self.human_seat {
+            self.cursor_status = image;
+        } else if *seat == self.ai_seat {
+            self.ai_cursor_status = image;
+        }
     }
 
     fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
         self.backend_data.update_led_state(led_state)
     }
 }
-delegate_seat!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+// Manual GlobalDispatch for WlSeat — custom can_view() for two-seat filtering
+impl<BackendData: Backend + 'static> GlobalDispatch<WlSeat, SeatGlobalData<AnvilState<BackendData>>>
+    for AnvilState<BackendData>
+{
+    fn bind(
+        state: &mut Self,
+        dh: &DisplayHandle,
+        client: &Client,
+        resource: New<WlSeat>,
+        global_data: &SeatGlobalData<Self>,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        <SeatState<Self> as GlobalDispatch<WlSeat, SeatGlobalData<Self>, Self>>::bind(
+            state, dh, client, resource, global_data, data_init,
+        )
+    }
+
+    fn can_view(client: Client, global_data: &SeatGlobalData<Self>) -> bool {
+        let workspace_id = client
+            .get_data::<ClientState>()
+            .and_then(|cs| *cs.workspace_id.lock().unwrap());
+        crate::workspace::seat_can_view(workspace_id, global_data.seat_name())
+    }
+}
+
+// Keep the 4 Dispatch impls via delegate macros
+delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [WlSeat: SeatUserData<AnvilState<BackendData>>] => SeatState<AnvilState<BackendData>>);
+delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [WlPointer: PointerUserData<AnvilState<BackendData>>] => SeatState<AnvilState<BackendData>>);
+delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [WlKeyboard: KeyboardUserData<AnvilState<BackendData>>] => SeatState<AnvilState<BackendData>>);
+delegate_dispatch!(@<BackendData: Backend + 'static> AnvilState<BackendData>: [WlTouch: TouchUserData<AnvilState<BackendData>>] => SeatState<AnvilState<BackendData>>);
 
 impl<BackendData: Backend> TabletSeatHandler for AnvilState<BackendData> {
     fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
@@ -363,7 +488,7 @@ impl<BackendData: Backend> InputMethodHandler for AnvilState<BackendData> {
     }
 
     fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, smithay::utils::Logical> {
-        self.space
+        self.workspaces.space()
             .elements()
             .find_map(|window| (window.wl_surface().as_deref() == Some(parent)).then(|| window.geometry()))
             .unwrap_or_default()
@@ -414,9 +539,9 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
             constraint.is_some_and(|c| c.is_active())
         }) {
             let origin = self
-                .space
+                .workspaces.space()
                 .elements()
-                .find_map(|window| {
+                .find_map(|window: &WindowElement| {
                     (window.wl_surface().as_deref() == Some(surface)).then(|| window.geometry())
                 })
                 .unwrap_or_default()
@@ -438,8 +563,8 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
 
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         if let Some((serial, seat)) = data.serial {
-            let keyboard = self.seat.get_keyboard().unwrap();
-            Seat::from_resource(&seat) == Some(self.seat.clone())
+            let keyboard = self.human_seat.get_keyboard().unwrap();
+            Seat::from_resource(&seat) == Some(self.human_seat.clone())
                 && keyboard
                     .last_enter()
                     .map(|last_enter| serial.is_no_older_than(&last_enter))
@@ -458,12 +583,12 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
         if token_data.timestamp.elapsed().as_secs() < 10 {
             // Just grant the wish
             let w = self
-                .space
+                .workspaces.space()
                 .elements()
-                .find(|window| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
+                .find(|window: &&WindowElement| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
                 .cloned();
             if let Some(window) = w {
-                self.space.raise_element(&window, true);
+                self.workspaces.space_mut().raise_element(&window, true);
             }
         }
     }
@@ -473,18 +598,19 @@ delegate_xdg_activation!(@<BackendData: Backend + 'static> AnvilState<BackendDat
 impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        // Set the default to client side
+        // Default to server-side decorations — compositor draws title bar, buttons, borders
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ClientSide);
+            state.decoration_mode = Some(Mode::ServerSide);
         });
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
 
         toplevel.with_pending_state(|state| {
+            // Honor client preference — if client explicitly requests ClientSide, allow it
             state.decoration_mode = Some(match mode {
-                DecorationMode::ServerSide => Mode::ServerSide,
-                _ => Mode::ClientSide,
+                DecorationMode::ClientSide => Mode::ClientSide,
+                _ => Mode::ServerSide,
             });
         });
 
@@ -494,8 +620,9 @@ impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     }
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        // When mode is unset, fall back to server-side
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ClientSide);
+            state.decoration_mode = Some(Mode::ServerSide);
         });
 
         if toplevel.is_initial_configure_sent() {
@@ -504,6 +631,48 @@ impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     }
 }
 delegate_xdg_decoration!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+impl<BackendData: Backend> KdeDecorationHandler for AnvilState<BackendData> {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration_state
+    }
+
+    fn new_decoration(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        decoration: &smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration,
+    ) {
+        use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
+        use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgMode;
+        // Tell the client (GTK3 apps) to use server-side decorations
+        decoration.mode(Mode::Server);
+        // Bridge: set decoration_mode on ToplevelSurface so ack_configure evaluates is_ssd = true
+        if let Some(toplevel) = self.xdg_shell_state.toplevel_surfaces().iter().find(|t| t.wl_surface() == surface) {
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = Some(XdgMode::ServerSide);
+            });
+        }
+    }
+
+    fn request_mode(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        decoration: &smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration,
+        _mode: smithay::reexports::wayland_server::WEnum<smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode>,
+    ) {
+        use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
+        use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgMode;
+        // Always enforce server-side decorations regardless of client request
+        decoration.mode(Mode::Server);
+        // Bridge: set decoration_mode on ToplevelSurface so ack_configure evaluates is_ssd = true
+        if let Some(toplevel) = self.xdg_shell_state.toplevel_surfaces().iter().find(|t| t.wl_surface() == surface) {
+            toplevel.with_pending_state(|state| {
+                state.decoration_mode = Some(XdgMode::ServerSide);
+            });
+        }
+    }
+}
+delegate_kde_decoration!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 delegate_xdg_shell!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 delegate_layer_shell!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -538,16 +707,16 @@ impl<BackendData: Backend> FractionalScaleHandler for AnvilState<BackendData> {
                         with_states(&root, |states| {
                             surface_primary_scanout_output(&root, states).or_else(|| {
                                 self.window_for_surface(&root).and_then(|window| {
-                                    self.space.outputs_for_element(&window).first().cloned()
+                                    self.workspaces.space().outputs_for_element(&window).first().cloned()
                                 })
                             })
                         })
                     } else {
                         self.window_for_surface(&root)
-                            .and_then(|window| self.space.outputs_for_element(&window).first().cloned())
+                            .and_then(|window| self.workspaces.space().outputs_for_element(&window).first().cloned())
                     }
                 })
-                .or_else(|| self.space.outputs().next().cloned());
+                .or_else(|| self.workspaces.space().outputs().next().cloned());
             if let Some(output) = primary_scanout_output {
                 with_fractional_scale(states, |fractional_scale| {
                     fractional_scale.set_preferred_scale(output.current_scale().fractional_scale());
@@ -582,9 +751,9 @@ delegate_security_context!(@<BackendData: Backend + 'static> AnvilState<BackendD
 impl<BackendData: Backend + 'static> XWaylandKeyboardGrabHandler for AnvilState<BackendData> {
     fn keyboard_focus_for_xsurface(&self, surface: &WlSurface) -> Option<KeyboardFocusTarget> {
         let elem = self
-            .space
+            .workspaces.space()
             .elements()
-            .find(|elem| elem.wl_surface().as_deref() == Some(surface))?;
+            .find(|elem: &&WindowElement| elem.wl_surface().as_deref() == Some(surface))?;
         Some(KeyboardFocusTarget::Window(elem.0.clone()))
     }
 }
@@ -656,9 +825,34 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
         // Anvil doesn't track sessions; they clean up on drop
     }
 
-    fn frame(&mut self, _session: &SessionRef, frame: Frame) {
-        // Anvil doesn't implement actual capture
-        frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+    fn frame(&mut self, session: &SessionRef, frame: Frame) {
+        use smithay::output::WeakOutput;
+
+        // Resolve the session's capture source to an Output
+        let source = session.source();
+        let weak_output = match source.user_data().get::<WeakOutput>() {
+            Some(wo) => wo,
+            None => {
+                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+                return;
+            }
+        };
+        let output = match weak_output.upgrade() {
+            Some(o) => o,
+            None => {
+                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+                return;
+            }
+        };
+
+        // Check if this output belongs to an AI workspace mirror
+        if let Some(workspace_id) = self.mirror.workspace_for_output(&output) {
+            // Queue for rendering during the next render loop pass
+            self.mirror.queue_frame(workspace_id, frame);
+        } else {
+            // Physical output capture — not implemented
+            frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+        }
     }
 }
 smithay::delegate_image_copy_capture!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -720,6 +914,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        let kde_decoration_state = {
+            use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDefaultMode;
+            KdeDecorationState::new::<Self>(&dh, KdeDefaultMode::Server)
+        };
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
@@ -751,13 +949,19 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
 
-        // init input
-        let seat_name = backend_data.seat_name();
-        let mut seat = seat_state.new_wl_seat(&dh, seat_name.clone());
+        // init input — human seat
+        let human_seat_name = backend_data.seat_name();
+        let mut human_seat = seat_state.new_wl_seat(&dh, "human".to_string());
 
-        let pointer = seat.add_pointer();
-        seat.add_keyboard(XkbConfig::default(), 200, 25)
-            .expect("Failed to initialize the keyboard");
+        let human_pointer = human_seat.add_pointer();
+        human_seat.add_keyboard(XkbConfig::default(), 200, 25)
+            .expect("Failed to initialize the human seat keyboard");
+
+        // init input — AI seat
+        let mut ai_seat = seat_state.new_wl_seat(&dh, "ai".to_string());
+        let ai_pointer = ai_seat.add_pointer();
+        ai_seat.add_keyboard(XkbConfig::default(), 200, 25)
+            .expect("Failed to initialize the AI seat keyboard");
 
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
 
@@ -767,13 +971,24 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         #[cfg(feature = "xwayland")]
         XWaylandKeyboardGrabState::new::<Self>(&dh.clone());
 
-        AnvilState {
+        // Build export state and advertise its output as a wl_output global
+        // BEFORE moving dh into the struct.
+        let export = {
+            let mut es = crate::workspace::ExportState::new();
+            let _global = es.output().create_global::<AnvilState<BackendData>>(&dh);
+            es
+        };
+
+        let mut state = AnvilState {
             backend_data,
             display_handle: dh,
             socket_name,
             running: Arc::new(AtomicBool::new(true)),
             handle,
-            space: Space::default(),
+            workspaces: crate::workspace::WorkspaceManager::new(),
+            mirror: crate::workspace::MirrorState::new(),
+            export,
+            cockpit_socket: compstr::socket::CockpitSocket::new(),
             popups: PopupManager::default(),
             compositor_state,
             data_device_state,
@@ -787,6 +1002,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             viewporter_state,
             xdg_activation_state,
             xdg_decoration_state,
+            kde_decoration_state,
             xdg_shell_state,
             presentation_state,
             fractional_scale_manager_state,
@@ -800,9 +1016,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             cursor_status: CursorImageStatus::default_named(),
-            seat_name,
-            seat,
-            pointer,
+            ai_cursor_status: CursorImageStatus::default_named(),
+            human_seat_name,
+            human_seat,
+            human_pointer,
+            ai_seat,
+            ai_pointer,
+            copilot_mode: None,
             clock,
 
             #[cfg(feature = "xwayland")]
@@ -814,7 +1034,21 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             #[cfg(feature = "debug")]
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
+            decoration_theme: DecorationTheme::load(),
+            snap_preview: None,
+
+            workspace_sockets: HashMap::new(),
+        };
+
+        // Set up IPC for workspace commands (/var/anvil/cmd/ → inotify)
+        if let Err(e) = compstr::ipc::setup_ipc_watch(&state.handle) {
+            warn!("Failed to set up IPC watch: {}", e);
         }
+
+        // Drain any commands that were written before the inotify watch started
+        state.process_ipc_commands();
+
+        state
     }
 
     #[cfg(feature = "xwayland")]
@@ -879,19 +1113,35 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
         #[allow(clippy::mutable_key_type)]
         let mut clients: HashMap<ClientId, Client> = HashMap::new();
-        self.space.elements().for_each(|window| {
-            window.with_surfaces(|surface, states| {
-                if let Some(mut commit_timer_state) = states
-                    .data_map
-                    .get::<CommitTimerBarrierStateUserData>()
-                    .map(|commit_timer| commit_timer.lock().unwrap())
-                {
-                    commit_timer_state.signal_until(frame_target);
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
-                }
+
+        // Signal commit timers for the active workspace's elements.
+        // When active_workspace != 0, also signal AI workspace elements for frame callbacks.
+        let active_ws = self.workspaces.active_workspace();
+        let active_space = if active_ws != 0 {
+            self.workspaces.get_space(active_ws)
+        } else {
+            None
+        };
+        let spaces_to_signal: Vec<&Space<crate::shell::WindowElement>> = if let Some(ai_space) = active_space {
+            vec![self.workspaces.space(), ai_space]
+        } else {
+            vec![self.workspaces.space()]
+        };
+        for space in spaces_to_signal {
+            space.elements().for_each(|window| {
+                window.with_surfaces(|surface, states| {
+                    if let Some(mut commit_timer_state) = states
+                        .data_map
+                        .get::<CommitTimerBarrierStateUserData>()
+                        .map(|commit_timer| commit_timer.lock().unwrap())
+                    {
+                        commit_timer_state.signal_until(frame_target);
+                        let client = surface.client().unwrap();
+                        clients.insert(client.id(), client);
+                    }
+                });
             });
-        });
+        }
 
         let map = smithay::desktop::layer_map_for_output(output);
         for layer_surface in map.layers() {
@@ -958,7 +1208,16 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         #[allow(clippy::mutable_key_type)]
         let mut clients: HashMap<ClientId, Client> = HashMap::new();
 
-        self.space.elements().for_each(|window| {
+        // Post-repaint for the active workspace's elements.
+        // When rendering an AI workspace to the physical display, its elements need
+        // frame callbacks and FIFO barrier signals too.
+        let active_ws = self.workspaces.active_workspace();
+        let space = if active_ws != 0 {
+            self.workspaces.get_space(active_ws).unwrap_or_else(|| self.workspaces.space())
+        } else {
+            self.workspaces.space()
+        };
+        space.elements().for_each(|window| {
             window.with_surfaces(|surface, states| {
                 let primary_scanout_output = surface_primary_scanout_output(surface, states);
 
@@ -988,7 +1247,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 }
             });
 
-            if self.space.outputs_for_element(window).contains(output) {
+            if space.outputs_for_element(window).contains(output) {
                 window.send_frame(output, time, throttle, surface_primary_scanout_output);
                 if let Some(dmabuf_feedback) = dmabuf_feedback.as_ref() {
                     window.send_dmabuf_feedback(output, surface_primary_scanout_output, |surface, _| {
