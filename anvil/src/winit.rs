@@ -250,6 +250,12 @@ pub fn run_winit() {
         Err(e) => error!("Failed to spawn Chromium kiosk: {}", e),
     }
 
+    // Spawn Forge daemon — must be ready before panels connect
+    match std::process::Command::new("/usr/local/bin/forge").arg("run").spawn() {
+        Ok(child) => info!("Spawned forge (pid {})", child.id()),
+        Err(e) => error!("Failed to spawn forge: {}", e),
+    }
+
     // Spawn panels — they inherit WAYLAND_DISPLAY from env
     if let Some(ref socket_name) = state.socket_name {
         for panel in &["/usr/local/bin/cockpit", "/usr/local/bin/gui/dock"] {
