@@ -576,6 +576,9 @@ pub fn run_udev() {
         Err(e) => error!("Failed to spawn Chromium kiosk: {}", e),
     }
 
+    // Supervised compilr daemon — waits for CDP, restarts on crash
+    compstr::daemons::supervise_compilr();
+
     // Spawn Forge daemon — must be ready before panels connect
     match std::process::Command::new("/usr/local/bin/forge").arg("run").spawn() {
         Ok(child) => info!("Spawned forge (pid {})", child.id()),
@@ -584,7 +587,7 @@ pub fn run_udev() {
 
     // Spawn panels — they inherit WAYLAND_DISPLAY from env
     if let Some(ref socket_name) = state.socket_name {
-        for panel in &["/usr/local/bin/cockpit", "/usr/local/bin/gui/dock"] {
+        for panel in &["/usr/local/bin/cockpit"] {
             match std::process::Command::new(panel)
                 .env("WAYLAND_DISPLAY", socket_name)
                 .spawn()
@@ -601,6 +604,7 @@ pub fn run_udev() {
             state.running.store(false, Ordering::SeqCst);
         } else {
             state.workspaces.refresh_all();
+            state.stacking.reapply(state.workspaces.space_mut());
             state.popups.cleanup();
             display_handle.flush_clients().unwrap();
         }
@@ -1032,21 +1036,26 @@ impl AnvilState<UdevData> {
             );
             let global = output.create_global::<AnvilState<UdevData>>(&self.display_handle);
 
-            let x = self
-                .workspaces
-                .space()
-                .outputs()
-                .fold(0, |acc, o| acc + self.workspaces.space().output_geometry(o).unwrap().size.w);
-            let position = (x, 0).into();
-
-            output.set_preferred(wl_mode);
-            output.change_current_state(Some(wl_mode), None, None, Some(position));
-            self.workspaces.space_mut().map_output(&output, position);
-
             output.user_data().insert_if_missing(|| UdevOutputId {
                 crtc,
                 device_id: node,
             });
+
+            output.set_preferred(wl_mode);
+
+            // Space-per-output (COMPSTR-OUTPUT-SPACES-001): every desktop connector gets its
+            // own Workspace via WorkspaceManager::register_output. Workspace 0 (human context)
+            // additionally dual-maps the first-seen connector so cockpit keeps rendering on
+            // the laptop panel — this is the LAST surviving use of the old is_primary semantics,
+            // repurposed as "first-seen boot output owns the workspace 0 mapping".
+            let is_first_seen = device.surfaces.is_empty();
+            let _ws_id = self.workspaces.register_output(output.name(), output.clone());
+
+            let position: smithay::utils::Point<i32, smithay::utils::Logical> = (0, 0).into();
+            output.change_current_state(Some(wl_mode), None, None, Some(position));
+            if is_first_seen {
+                self.workspaces.space_mut().map_output(&output, position);
+            }
 
             #[cfg(feature = "debug")]
             let fps_element = self.backend_data.fps_texture.clone().map(FpsElement::new);
@@ -1144,6 +1153,7 @@ impl AnvilState<UdevData> {
             return;
         };
 
+
         if let Some(pos) = device
             .non_desktop_connectors
             .iter()
@@ -1154,8 +1164,12 @@ impl AnvilState<UdevData> {
                 leasing_state.withdraw_connector(connector.handle());
             }
         } else if let Some(surface) = device.surfaces.remove(&crtc) {
+            // Space-per-output teardown: unmap from workspace 0 (idempotent; was only mapped
+            // for the first-seen connector via the dual-map in connector_connected), then
+            // destroy the per-output Workspace created by register_output.
             self.workspaces.space_mut().unmap_output(&surface.output);
             self.workspaces.space_mut().refresh();
+            self.workspaces.unregister_output(&surface.output.name());
         }
 
         let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
@@ -1172,6 +1186,7 @@ impl AnvilState<UdevData> {
     }
 
     fn device_changed(&mut self, node: DrmNode) {
+
         let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
             device
         } else {
@@ -1207,8 +1222,8 @@ impl AnvilState<UdevData> {
             }
         }
 
-        // fixup window coordinates
-        crate::shell::fixup_positions(self.workspaces.space_mut(), self.human_pointer.current_location());
+        // Output events never touch workspace 0 under Space-per-output (INVARIANT 2).
+        // fixup_positions is reserved for user-initiated scale/transform keybinds.
     }
 
     fn device_removed(&mut self, node: DrmNode) {
@@ -1245,7 +1260,7 @@ impl AnvilState<UdevData> {
             debug!("Dropping device");
         }
 
-        crate::shell::fixup_positions(self.workspaces.space_mut(), self.human_pointer.current_location());
+        // Output events never touch workspace 0 under Space-per-output (INVARIANT 2).
     }
 
     fn frame_finish(&mut self, dev_id: DrmNode, crtc: crtc::Handle, metadata: &mut Option<DrmEventMetadata>) {
@@ -1581,13 +1596,25 @@ impl AnvilState<UdevData> {
             );
         }
 
+        // Process pending physical output capture frames (e.g. grim screenshot of eDP-1)
+        if self.mirror.has_physical_frames() {
+            let pending = self.mirror.take_physical_frames();
+            let capture_space = self.workspaces.space();
+            render_physical_capture_frames(
+                &mut renderer,
+                capture_space,
+                &output,
+                pending,
+            );
+        }
+
         // Offscreen export for cockpit pipeline — DMA-BUF double-buffer + unix socket
         {
             if self.export.should_export() {
                 let egl_ctx = renderer.as_mut().egl_context();
                 let egl_display = egl_ctx.display().clone();
                 let raw_egl_context = egl_ctx.get_context_handle();
-                match compstr::export::export_frame(
+                match compstr::screen::export::export_frame(
                     &mut renderer,
                     &egl_display,
                     raw_egl_context,
@@ -2068,6 +2095,136 @@ fn render_mirror_frames(
         }
 
         // Signal success — full frame, no partial damage
+        frame.success(
+            Transform::Normal,
+            None::<Vec<smithay::utils::Rectangle<i32, smithay::utils::Buffer>>>,
+            std::time::Duration::ZERO,
+        );
+    }
+}
+
+/// Process pending physical output capture frames (e.g. grim screenshot).
+/// Renders workspace 0 to an offscreen buffer and copies to the frame's SHM buffer.
+fn render_physical_capture_frames(
+    renderer: &mut UdevRenderer<'_>,
+    space: &smithay::desktop::Space<WindowElement>,
+    output: &Output,
+    pending: Vec<compstr::screen::mirror::PhysicalPendingFrame>,
+) {
+    use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::gles::GlesTexture;
+    use smithay::wayland::shm::with_buffer_contents_mut;
+    use smithay::wayland::image_copy_capture::CaptureFailureReason;
+    use crate::drawing::CLEAR_COLOR;
+    use crate::render::OutputRenderElements;
+
+    for pending_frame in pending {
+        let frame = pending_frame.frame;
+        let buffer = frame.buffer();
+
+        let (buf_w, buf_h) = match smithay::wayland::shm::with_buffer_contents(&buffer, |_, _, data| {
+            (data.width, data.height)
+        }) {
+            Ok(dims) => dims,
+            Err(_) => {
+                frame.fail(CaptureFailureReason::BufferConstraints);
+                continue;
+            }
+        };
+
+        let mut offscreen_tex = match <_ as Offscreen<GlesTexture>>::create_buffer(
+            renderer,
+            Fourcc::Argb8888,
+            (buf_w, buf_h).into(),
+        ) {
+            Ok(tex) => tex,
+            Err(e) => {
+                tracing::warn!("Physical capture: failed to create offscreen buffer: {:?}", e);
+                frame.fail(CaptureFailureReason::Unknown);
+                continue;
+            }
+        };
+
+        let mut fb = match Bind::<GlesTexture>::bind(renderer, &mut offscreen_tex) {
+            Ok(fb) => fb,
+            Err(e) => {
+                tracing::warn!("Physical capture: failed to bind offscreen target: {:?}", e);
+                frame.fail(CaptureFailureReason::Unknown);
+                continue;
+            }
+        };
+
+        let space_elements = match smithay::desktop::space::space_render_elements::<_, WindowElement, _>(
+            renderer,
+            [space],
+            output,
+            1.0,
+        ) {
+            Ok(elements) => elements,
+            Err(e) => {
+                tracing::warn!("Physical capture: failed to get render elements: {:?}", e);
+                frame.fail(CaptureFailureReason::Unknown);
+                continue;
+            }
+        };
+
+        let elements: Vec<OutputRenderElements<_, _>> = space_elements
+            .into_iter()
+            .map(OutputRenderElements::Space)
+            .collect();
+
+        let mut damage_tracker = OutputDamageTracker::from_output(output);
+        if let Err(e) = damage_tracker.render_output(
+            renderer,
+            &mut fb,
+            0,
+            &elements,
+            CLEAR_COLOR,
+        ) {
+            tracing::warn!("Physical capture: render failed: {:?}", e);
+            frame.fail(CaptureFailureReason::Unknown);
+            continue;
+        }
+
+        let region = smithay::utils::Rectangle::from_size((buf_w, buf_h).into());
+        let mapping = match ExportMem::copy_framebuffer(
+            renderer,
+            &fb,
+            region,
+            Fourcc::Argb8888,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Physical capture: failed to copy framebuffer: {:?}", e);
+                frame.fail(CaptureFailureReason::Unknown);
+                continue;
+            }
+        };
+
+        let pixels = match renderer.map_texture(&mapping) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Physical capture: failed to map texture: {:?}", e);
+                frame.fail(CaptureFailureReason::Unknown);
+                continue;
+            }
+        };
+
+        let write_result = unsafe {
+            with_buffer_contents_mut(&buffer, |ptr, len, data| {
+                let stride = data.stride as usize;
+                let height = data.height as usize;
+                let copy_len = (stride * height).min(len).min(pixels.len());
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr, copy_len);
+            })
+        };
+
+        if write_result.is_err() {
+            frame.fail(CaptureFailureReason::Unknown);
+            continue;
+        }
+
         frame.success(
             Transform::Normal,
             None::<Vec<smithay::utils::Rectangle<i32, smithay::utils::Buffer>>>,
