@@ -250,6 +250,9 @@ pub fn run_winit() {
         Err(e) => error!("Failed to spawn Chromium kiosk: {}", e),
     }
 
+    // Supervised compilr daemon — waits for CDP, restarts on crash
+    compstr::daemons::supervise_compilr();
+
     // Spawn Forge daemon — must be ready before panels connect
     match std::process::Command::new("/usr/local/bin/forge").arg("run").spawn() {
         Ok(child) => info!("Spawned forge (pid {})", child.id()),
@@ -258,7 +261,7 @@ pub fn run_winit() {
 
     // Spawn panels — they inherit WAYLAND_DISPLAY from env
     if let Some(ref socket_name) = state.socket_name {
-        for panel in &["/usr/local/bin/cockpit", "/usr/local/bin/gui/dock"] {
+        for panel in &["/usr/local/bin/cockpit"] {
             match std::process::Command::new(panel)
                 .env("WAYLAND_DISPLAY", socket_name)
                 .spawn()
@@ -519,6 +522,7 @@ pub fn run_winit() {
             state.running.store(false, Ordering::SeqCst);
         } else {
             state.workspaces.space_mut().refresh();
+            state.stacking.reapply(state.workspaces.space_mut());
             state.popups.cleanup();
             display_handle.flush_clients().unwrap();
         }

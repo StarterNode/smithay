@@ -329,7 +329,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
 
             if let Some((window, _)) = self.workspaces.space().element_under(location).map(|(w, p)| (w.clone(), p)) {
-                self.workspaces.space_mut().raise_element(&window, true);
+                self.stacking.raise_window(&window);
+                self.stacking.reapply(self.workspaces.space_mut());
                 #[cfg(feature = "xwayland")]
                 if let Some(surface) = window.0.x11_surface() {
                     self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
@@ -1371,6 +1372,8 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::ToggleTint)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::D {
         Some(KeyAction::ToggleDecorations)
+    } else if let Some(cmd) = compstr::hotkeys::keybinds::process_shortcut(&modifiers, keysym) {
+        Some(KeyAction::Run(cmd.into()))
     } else {
         None
     }

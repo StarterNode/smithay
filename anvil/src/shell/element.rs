@@ -99,13 +99,33 @@ impl WindowElement {
         window_type: WindowSurfaceType,
     ) -> Option<(PointerFocusTarget, Point<i32, Logical>)> {
         let state = self.decoration_state();
+        let offset = if state.is_ssd {
+            Point::from((0, HEADER_BAR_HEIGHT))
+        } else {
+            Point::default()
+        };
+
+        // Check for popup/client surface first — popups extend beyond the
+        // window and must take priority over SSD border zones.
+        let surface_under = self.0.surface_under(location - offset.to_f64(), window_type);
+        let client_hit = match self.0.underlying_surface() {
+            WindowSurface::Wayland(_) => {
+                surface_under.map(|(surface, loc)| (PointerFocusTarget::WlSurface(surface), loc + offset))
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(s) => {
+                surface_under.map(|(_, loc)| (PointerFocusTarget::X11Surface(s.clone()), loc + offset))
+            }
+        };
+        if client_hit.is_some() {
+            return client_hit;
+        }
+
+        // No popup/client surface — check SSD zones
         if state.is_ssd {
-            // Title bar — always routes to SSD
             if location.y < HEADER_BAR_HEIGHT as f64 {
                 return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
             }
-
-            // Border/corner zones — route to SSD for resize
             let window_geo = SpaceElement::geometry(&self.0);
             let w = window_geo.size.w as f64;
             let h = (HEADER_BAR_HEIGHT + window_geo.size.h) as f64;
@@ -115,23 +135,8 @@ impl WindowElement {
                 return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
             }
         }
-        let offset = if state.is_ssd {
-            Point::from((0, HEADER_BAR_HEIGHT))
-        } else {
-            Point::default()
-        };
 
-        let surface_under = self.0.surface_under(location - offset.to_f64(), window_type);
-        let (under, loc) = match self.0.underlying_surface() {
-            WindowSurface::Wayland(_) => {
-                surface_under.map(|(surface, loc)| (PointerFocusTarget::WlSurface(surface), loc))
-            }
-            #[cfg(feature = "xwayland")]
-            WindowSurface::X11(s) => {
-                surface_under.map(|(_, loc)| (PointerFocusTarget::X11Surface(s.clone()), loc))
-            }
-        }?;
-        Some((under, loc + offset))
+        None
     }
 
     pub fn with_surfaces<F>(&self, processor: F)
@@ -667,7 +672,15 @@ where
 
             let mut vec: Vec<WindowRenderElement<R>> = Vec::new();
 
-            // Title bar (single MemoryRenderBuffer — highest z-order)
+            // Window content + popups first — popups extend beyond the
+            // window and must render ABOVE SSD borders (higher z = earlier in vec).
+            let content_location_y = location.y + (scale.y * HEADER_BAR_HEIGHT as f64) as i32;
+            let content_location = Point::from((location.x, content_location_y));
+            let window_elements =
+                AsRenderElements::render_elements(&self.0, renderer, content_location, scale, alpha);
+            vec.extend(window_elements);
+
+            // Title bar
             if let Some(ref buffer) = state.header_bar.title_bar_buffer {
                 if let Ok(elem) = MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
@@ -682,7 +695,7 @@ where
                 }
             }
 
-            // Border elements — rendered on top of client surface at edges
+            // Border elements — lowest z, behind popups
             let border_elements =
                 state
                     .header_bar
@@ -691,11 +704,6 @@ where
 
             drop(state);
 
-            location.y += (scale.y * HEADER_BAR_HEIGHT as f64) as i32;
-
-            let window_elements =
-                AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);
-            vec.extend(window_elements);
             vec.into_iter().map(C::from).collect()
         } else {
             AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha)

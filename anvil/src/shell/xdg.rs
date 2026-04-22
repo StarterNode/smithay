@@ -87,7 +87,24 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 space.map_element(window.clone(), Point::default(), true);
             }
         } else {
-            place_new_window(space, self.human_pointer.current_location(), &window, true);
+            // Check for transient/child window — position over parent
+            let has_parent = surface.parent().is_some_and(|parent_wl| {
+                let parent = space.elements()
+                    .find(|w| w.wl_surface().map(|s| &*s == &parent_wl).unwrap_or(false))
+                    .cloned();
+                if let Some(ref p) = parent {
+                    compstr::stacking::position_over_parent(space, &parent_wl, &window);
+                    self.stacking.push_above(&window, p);
+                    true
+                } else {
+                    false
+                }
+            });
+            if !has_parent {
+                place_new_window(space, self.human_pointer.current_location(), &window, true);
+                self.stacking.push_window(&window);
+            }
+            self.stacking.reapply(space);
         }
 
         compositor::add_post_commit_hook(surface.wl_surface(), |state: &mut Self, _, surface| {
@@ -118,6 +135,15 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         });
         self.unconstrain_popup(&surface);
         surface.send_repositioned(token);
+    }
+
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        let window = self.workspaces.window_for_surface(surface.wl_surface());
+        let new_parent = surface.parent().and_then(|ps| self.workspaces.window_for_surface(&ps));
+        if let Some(ref w) = window {
+            self.stacking.reparent_window(w, new_parent.as_ref());
+            self.stacking.reapply(self.workspaces.space_mut());
+        }
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
@@ -305,11 +331,15 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 let is_ssd = if is_fullscreen {
                     false
                 } else {
+                    // If decoration was negotiated via xdg-decoration, respect it.
+                    // If no negotiation happened (None), assume client handles its
+                    // own decoration (CSD) — avoids double-decorating GTK3 apps
+                    // that don't use the xdg-decoration protocol (ANVIL-007).
                     configure
                         .state
                         .decoration_mode
                         .map(|mode| mode == Mode::ServerSide)
-                        .unwrap_or(true)
+                        .unwrap_or(false)
                 };
                 window.set_ssd(is_ssd);
             }

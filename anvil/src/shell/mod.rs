@@ -399,10 +399,6 @@ fn place_new_window(
     window: &WindowElement,
     activate: bool,
 ) {
-    // place the window at a random location on same output as pointer
-    // or if there is not output in a [0;800]x[0;800] square
-    use rand::distributions::{Distribution, Uniform};
-
     let output = space
         .output_under(pointer_location)
         .next()
@@ -417,23 +413,18 @@ fn place_new_window(
         })
         .unwrap_or_else(|| Rectangle::from_size((800, 800).into()));
 
-    // set the initial toplevel bounds
+    // set the initial toplevel bounds and suggest a sane initial size
+    let suggested_size = compstr::placement::suggest_initial_size(output_geometry);
     #[allow(irrefutable_let_patterns)]
     if let Some(toplevel) = window.0.toplevel() {
         toplevel.with_pending_state(|state| {
-            state.bounds = Some(output_geometry.size);
+            state.bounds = Some(suggested_size);
+            state.size = Some(suggested_size);
         });
     }
 
-    let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
-    let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-    let x_range = Uniform::new(output_geometry.loc.x, max_x);
-    let y_range = Uniform::new(output_geometry.loc.y, max_y);
-    let mut rng = rand::thread_rng();
-    let x = x_range.sample(&mut rng);
-    let y = y_range.sample(&mut rng);
-
-    space.map_element(window.clone(), (x, y), activate);
+    let loc = compstr::placement::center_in_zone(output_geometry, Some(suggested_size));
+    space.map_element(window.clone(), loc, activate);
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {

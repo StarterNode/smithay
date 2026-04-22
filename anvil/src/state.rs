@@ -158,6 +158,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub mirror: crate::workspace::MirrorState,
     pub export: crate::workspace::ExportState,
     pub cockpit_socket: compstr::socket::CockpitSocket,
+    pub stacking: compstr::stacking::StackingOrder<crate::shell::WindowElement>,
     pub popups: PopupManager,
 
     // smithay state
@@ -598,9 +599,9 @@ delegate_xdg_activation!(@<BackendData: Backend + 'static> AnvilState<BackendDat
 impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        // Default to server-side decorations — compositor draws title bar, buttons, borders
+        // Default to client-side decorations — CSD apps draw their own, anvil draws none (ANVIL-007)
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(Mode::ClientSide);
         });
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
@@ -620,9 +621,9 @@ impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     }
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        // When mode is unset, fall back to server-side
+        // When mode is unset, fall back to client-side (ANVIL-007)
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(Mode::ClientSide);
         });
 
         if toplevel.is_initial_configure_sent() {
@@ -644,7 +645,7 @@ impl<BackendData: Backend> KdeDecorationHandler for AnvilState<BackendData> {
     ) {
         use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgMode;
-        // Tell the client (GTK3 apps) to use server-side decorations
+        // Default to server-side — compositor draws SSD for KDE-protocol apps
         decoration.mode(Mode::Server);
         // Bridge: set decoration_mode on ToplevelSurface so ack_configure evaluates is_ssd = true
         if let Some(toplevel) = self.xdg_shell_state.toplevel_surfaces().iter().find(|t| t.wl_surface() == surface) {
@@ -658,11 +659,11 @@ impl<BackendData: Backend> KdeDecorationHandler for AnvilState<BackendData> {
         &mut self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         decoration: &smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration,
-        _mode: smithay::reexports::wayland_server::WEnum<smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode>,
+        mode: smithay::reexports::wayland_server::WEnum<smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode>,
     ) {
         use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgMode;
-        // Always enforce server-side decorations regardless of client request
+        // Always enforce server-side decorations for KDE-protocol apps
         decoration.mode(Mode::Server);
         // Bridge: set decoration_mode on ToplevelSurface so ack_configure evaluates is_ssd = true
         if let Some(toplevel) = self.xdg_shell_state.toplevel_surfaces().iter().find(|t| t.wl_surface() == surface) {
@@ -821,8 +822,9 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
         })
     }
 
-    fn new_session(&mut self, _session: Session) {
-        // Anvil doesn't track sessions; they clean up on drop
+    fn new_session(&mut self, session: Session) {
+        // Must store the Session to prevent Drop from sending stopped to the client.
+        self.mirror.track_session(session);
     }
 
     fn frame(&mut self, session: &SessionRef, frame: Frame) {
@@ -850,8 +852,8 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
             // Queue for rendering during the next render loop pass
             self.mirror.queue_frame(workspace_id, frame);
         } else {
-            // Physical output capture — not implemented
-            frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+            // Physical output capture (e.g. grim screenshot of eDP-1)
+            self.mirror.queue_physical_frame(output, frame);
         }
     }
 }
@@ -989,6 +991,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             mirror: crate::workspace::MirrorState::new(),
             export,
             cockpit_socket: compstr::socket::CockpitSocket::new(),
+            stacking: compstr::stacking::StackingOrder::new(),
             popups: PopupManager::default(),
             compositor_state,
             data_device_state,
