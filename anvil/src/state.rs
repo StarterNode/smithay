@@ -155,6 +155,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // desktop
     pub workspaces: crate::workspace::WorkspaceManager<crate::shell::WindowElement>,
+    pub axis: compstr::axis::Axis,
     pub mirror: crate::workspace::MirrorState,
     pub export: crate::workspace::ExportState,
     pub cockpit_socket: compstr::socket::CockpitSocket,
@@ -988,6 +989,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             running: Arc::new(AtomicBool::new(true)),
             handle,
             workspaces: crate::workspace::WorkspaceManager::new(),
+            axis: compstr::axis::Axis::new(),
             mirror: crate::workspace::MirrorState::new(),
             export,
             cockpit_socket: compstr::socket::CockpitSocket::new(),

@@ -67,14 +67,14 @@ use smithay::{
         keyboard::LedState,
         pointer::{CursorImageAttributes, CursorImageStatus},
     },
-    output::{Mode as WlMode, Output, PhysicalProperties},
+    output::{Mode as WlMode, Output},
     reexports::{
         calloop::{
             timer::{TimeoutAction, Timer},
             EventLoop, RegistrationToken,
         },
         drm::{
-            control::{connector, crtc, Device, ModeTypeFlags},
+            control::{connector, crtc, Device},
             Device as _,
         },
         input::{DeviceCapability, Libinput},
@@ -701,7 +701,6 @@ pub type GbmDrmCompositor = DrmCompositor<
 
 struct SurfaceData {
     dh: DisplayHandle,
-    device_id: DrmNode,
     render_node: Option<DrmNode>,
     output: Output,
     global: Option<GlobalId>,
@@ -961,9 +960,6 @@ impl AnvilState<UdevData> {
             return;
         };
 
-        let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
-        let mut renderer = self.backend_data.gpus.single_renderer(&render_node).unwrap();
-
         let output_name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
         info!(?crtc, "Trying to setup connector {}", output_name,);
 
@@ -998,11 +994,6 @@ impl AnvilState<UdevData> {
             .and_then(|info| info.model())
             .unwrap_or_else(|| "Unknown".into());
 
-        let serial_number = display_info
-            .as_ref()
-            .and_then(|info| info.serial())
-            .unwrap_or_else(|| "Unknown".into());
-
         if non_desktop {
             info!("Connector {} is non-desktop, setting up for leasing", output_name);
             device.non_desktop_connectors.push((connector.handle(), crtc));
@@ -1014,135 +1005,132 @@ impl AnvilState<UdevData> {
                 );
             }
         } else {
-            let mode_id = connector
-                .modes()
-                .iter()
-                .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .unwrap_or(0);
+            // C1 capture (CEO 2026-04-26): is_first_seen must be read BEFORE
+            // attach_real_head's closure inserts SurfaceData. Boot-first
+            // connector additionally dual-maps into workspace 0 so cockpit
+            // renders on the laptop panel; subsequent connectors own only
+            // their connector-named Workspace.
+            let is_first_seen = device.surfaces.is_empty();
+            let position: smithay::utils::Point<i32, smithay::utils::Logical> = (0, 0).into();
 
-            let drm_mode = connector.modes()[mode_id];
-            let wl_mode = WlMode::from(drm_mode);
+            // Drop the &mut device borrow before calling attach_real_head — the
+            // closure re-acquires it via self.backend_data.backends.get_mut.
+            let _ = device;
 
-            let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
-            let output = Output::new(
-                output_name,
-                PhysicalProperties {
-                    size: (phys_w as i32, phys_h as i32).into(),
-                    subpixel: connector.subpixel().into(),
-                    make,
-                    model,
-                    serial_number,
+            let attach_result = self.axis.attach_real_head(
+                &connector,
+                crtc,
+                output_name.clone(),
+                &mut self.workspaces,
+                |output, crtc, drm_mode, connectors| -> Result<(), compstr::axis::AttachError> {
+                    let device = self.backend_data.backends.get_mut(&node).ok_or_else(|| {
+                        compstr::axis::AttachError::DrmInit(format!("device {node} not found"))
+                    })?;
+
+                    let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
+                    let mut renderer = self
+                        .backend_data
+                        .gpus
+                        .single_renderer(&render_node)
+                        .map_err(|e| compstr::axis::AttachError::DrmInit(format!("renderer: {e}")))?;
+
+                    let driver = device
+                        .drm_output_manager
+                        .device()
+                        .get_driver()
+                        .map_err(|e| compstr::axis::AttachError::DrmInit(format!("get_driver: {e}")))?;
+                    let mut planes = device
+                        .drm_output_manager
+                        .device()
+                        .planes(&crtc)
+                        .map_err(|e| compstr::axis::AttachError::DrmInit(format!("planes: {e}")))?;
+
+                    // Using an overlay plane on a nvidia card breaks
+                    if driver.name().to_string_lossy().to_lowercase().contains("nvidia")
+                        || driver
+                            .description()
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains("nvidia")
+                    {
+                        planes.overlay = vec![];
+                    }
+
+                    // C2 ordering: initialize_output FIRST (the fallible step).
+                    let drm_output = device
+                        .drm_output_manager
+                        .lock()
+                        .initialize_output::<_, OutputRenderElements<UdevRenderer<'_>, WindowRenderElement<UdevRenderer<'_>>>>(
+                            crtc,
+                            drm_mode,
+                            connectors,
+                            output,
+                            Some(planes),
+                            &mut renderer,
+                            &DrmOutputRenderElements::default(),
+                        )
+                        .map_err(|e| compstr::axis::AttachError::DrmInit(format!("initialize_output: {e}")))?;
+
+                    output.user_data().insert_if_missing(|| UdevOutputId { crtc, device_id: node });
+                    let wl_mode = WlMode::from(drm_mode);
+                    output.change_current_state(Some(wl_mode), None, None, Some(position));
+
+                    let disable_direct_scanout = std::env::var("ANVIL_DISABLE_DIRECT_SCANOUT").is_ok();
+                    let dmabuf_feedback = drm_output.with_compositor(|compositor| {
+                        compositor.set_debug_flags(self.backend_data.debug_flags);
+                        get_surface_dmabuf_feedback(
+                            self.backend_data.primary_gpu,
+                            device.render_node,
+                            node,
+                            &mut self.backend_data.gpus,
+                            compositor.surface(),
+                        )
+                    });
+
+                    #[cfg(feature = "debug")]
+                    let fps_element = self.backend_data.fps_texture.clone().map(FpsElement::new);
+
+                    // C2 ordering: create_global LAST — only published after
+                    // initialize_output succeeded; failure paths above leave
+                    // no observable state to roll back.
+                    let global = output.create_global::<AnvilState<UdevData>>(&self.display_handle);
+
+                    let surface = SurfaceData {
+                        dh: self.display_handle.clone(),
+                        render_node: device.render_node,
+                        output: output.clone(),
+                        global: Some(global),
+                        drm_output,
+                        disable_direct_scanout,
+                        #[cfg(feature = "debug")]
+                        fps: fps_ticker::Fps::default(),
+                        #[cfg(feature = "debug")]
+                        fps_element,
+                        dmabuf_feedback,
+                        last_presentation_time: None,
+                        vblank_throttle_timer: None,
+                    };
+                    device.surfaces.insert(crtc, surface);
+                    Ok(())
                 },
             );
-            let global = output.create_global::<AnvilState<UdevData>>(&self.display_handle);
 
-            output.user_data().insert_if_missing(|| UdevOutputId {
-                crtc,
-                device_id: node,
-            });
-
-            output.set_preferred(wl_mode);
-
-            // Space-per-output (COMPSTR-OUTPUT-SPACES-001): every desktop connector gets its
-            // own Workspace via WorkspaceManager::register_output. Workspace 0 (human context)
-            // additionally dual-maps the first-seen connector so cockpit keeps rendering on
-            // the laptop panel — this is the LAST surviving use of the old is_primary semantics,
-            // repurposed as "first-seen boot output owns the workspace 0 mapping".
-            let is_first_seen = device.surfaces.is_empty();
-            let _ws_id = self.workspaces.register_output(output.name(), output.clone());
-
-            let position: smithay::utils::Point<i32, smithay::utils::Logical> = (0, 0).into();
-            output.change_current_state(Some(wl_mode), None, None, Some(position));
-            if is_first_seen {
-                self.workspaces.space_mut().map_output(&output, position);
+            match attach_result {
+                Ok(_id) => {
+                    if is_first_seen {
+                        if let Some(managed) = self.axis.find_by_crtc(crtc) {
+                            let output = managed.output.clone();
+                            self.workspaces.space_mut().map_output(&output, position);
+                        }
+                    }
+                    self.handle.insert_idle(move |state| {
+                        state.render_surface(node, crtc, state.clock.now());
+                    });
+                }
+                Err(err) => {
+                    warn!("axis.attach_real_head failed for {output_name}: {err}");
+                }
             }
-
-            #[cfg(feature = "debug")]
-            let fps_element = self.backend_data.fps_texture.clone().map(FpsElement::new);
-
-            let driver = match drm_device.get_driver() {
-                Ok(driver) => driver,
-                Err(err) => {
-                    warn!("Failed to query drm driver: {}", err);
-                    return;
-                }
-            };
-
-            let mut planes = match drm_device.planes(&crtc) {
-                Ok(planes) => planes,
-                Err(err) => {
-                    warn!("Failed to query crtc planes: {}", err);
-                    return;
-                }
-            };
-
-            // Using an overlay plane on a nvidia card breaks
-            if driver.name().to_string_lossy().to_lowercase().contains("nvidia")
-                || driver
-                    .description()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains("nvidia")
-            {
-                planes.overlay = vec![];
-            }
-
-            let drm_output = match device
-                .drm_output_manager
-                .lock()
-                .initialize_output::<_, OutputRenderElements<UdevRenderer<'_>, WindowRenderElement<UdevRenderer<'_>>>>(
-                    crtc,
-                    drm_mode,
-                    &[connector.handle()],
-                    &output,
-                    Some(planes),
-                    &mut renderer,
-                    &DrmOutputRenderElements::default(),
-                ) {
-                Ok(drm_output) => drm_output,
-                Err(err) => {
-                    warn!("Failed to initialize drm output: {}", err);
-                    return;
-                }
-            };
-
-            let disable_direct_scanout = std::env::var("ANVIL_DISABLE_DIRECT_SCANOUT").is_ok();
-
-            let dmabuf_feedback = drm_output.with_compositor(|compositor| {
-                compositor.set_debug_flags(self.backend_data.debug_flags);
-
-                get_surface_dmabuf_feedback(
-                    self.backend_data.primary_gpu,
-                    device.render_node,
-                    node,
-                    &mut self.backend_data.gpus,
-                    compositor.surface(),
-                )
-            });
-
-            let surface = SurfaceData {
-                dh: self.display_handle.clone(),
-                device_id: node,
-                render_node: device.render_node,
-                output,
-                global: Some(global),
-                drm_output,
-                disable_direct_scanout,
-                #[cfg(feature = "debug")]
-                fps: fps_ticker::Fps::default(),
-                #[cfg(feature = "debug")]
-                fps_element,
-                dmabuf_feedback,
-                last_presentation_time: None,
-                vblank_throttle_timer: None,
-            };
-
-            device.surfaces.insert(crtc, surface);
-
-            // kick-off rendering
-            self.handle.insert_idle(move |state| {
-                state.render_surface(node, crtc, state.clock.now());
-            });
         }
     }
 
@@ -1164,12 +1152,14 @@ impl AnvilState<UdevData> {
                 leasing_state.withdraw_connector(connector.handle());
             }
         } else if let Some(surface) = device.surfaces.remove(&crtc) {
-            // Space-per-output teardown: unmap from workspace 0 (idempotent; was only mapped
-            // for the first-seen connector via the dual-map in connector_connected), then
-            // destroy the per-output Workspace created by register_output.
+            // C3 ordering (CEO 2026-04-26): keep the workspace 0 unmap_output
+            // (undoes the boot-first dual-map) and the refresh; replace the
+            // bare unregister_output with axis.detach_real_head so registry +
+            // workspace teardown happen as one delegation.
+            let connector_name = surface.output.name();
             self.workspaces.space_mut().unmap_output(&surface.output);
             self.workspaces.space_mut().refresh();
-            self.workspaces.unregister_output(&surface.output.name());
+            let _ = self.axis.detach_real_head(&connector_name, &mut self.workspaces);
         }
 
         let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
@@ -1286,17 +1276,13 @@ impl AnvilState<UdevData> {
             self.handle.remove(timer_token);
         }
 
-        let output = if let Some(output) = self.workspaces.space().outputs().find(|o| {
-            o.user_data().get::<UdevOutputId>()
-                == Some(&UdevOutputId {
-                    device_id: surface.device_id,
-                    crtc,
-                })
-        }) {
-            output.clone()
-        } else {
-            // somehow we got called with an invalid output
-            return;
+        // Phase 3 TASK 4b: route the frame_finish output lookup through axis.
+        // O(1) by_crtc index works regardless of which Workspace the Output
+        // is mapped into — the workspace-0-only failure mode for HDMI on
+        // every vblank is gone.
+        let output = match self.axis.find_by_crtc(crtc) {
+            Some(managed) => managed.output.clone(),
+            None => return,
         };
 
         let Some(frame_duration) = output
@@ -1474,17 +1460,13 @@ impl AnvilState<UdevData> {
     fn render_surface(&mut self, node: DrmNode, crtc: crtc::Handle, frame_target: Time<Monotonic>) {
         profiling::scope!("render_surface", &format!("{crtc:?}"));
 
-        let output = if let Some(output) = self.workspaces.space().outputs().find(|o| {
-            o.user_data().get::<UdevOutputId>()
-                == Some(&UdevOutputId {
-                    device_id: node,
-                    crtc,
-                })
-        }) {
-            output.clone()
-        } else {
-            // somehow we got called with an invalid output
-            return;
+        // Phase 3 TASK 4: route the render_surface output lookup through axis.
+        // Replaces the workspace-0-only `self.workspaces.space().outputs().find(...)`
+        // that failed for HDMI per test.json D4 — axis.find_by_crtc is keyed
+        // off the by_crtc HashMap and resolves regardless of dual-map state.
+        let output = match self.axis.find_by_crtc(crtc) {
+            Some(managed) => managed.output.clone(),
+            None => return,
         };
 
         self.pre_repaint(&output, frame_target);
@@ -1544,42 +1526,17 @@ impl AnvilState<UdevData> {
                 buffer
             });
 
-        // Per-Output Space routing (COMPSTR-OUTPUT-SPACES-001 Phase 1 Task 8a):
-        // Each physical connector has its own Workspace (via WorkspaceManager::register_output).
-        // Render the Workspace owning THIS connector's Output so HDMI renders HDMI's Space,
-        // not workspace 0's. The dual-mapped case (eDP-1 in both workspace 0 AND its own
-        // Workspace) resolves to workspace 0 by Vec-index order, which falls through to the
-        // active_workspace selection so Copilot-mode swap still works on the laptop panel.
-        let owning_ws = self.workspaces.workspace_for_output(&output);
-        let active_ws = self.workspaces.active_workspace();
-        let (render_ws_id, render_space_is_ai) = match owning_ws {
-            Some(ws_id) if ws_id != 0 => (ws_id, false),
-            _ if active_ws != 0 => {
-                // Copilot fall-through: eDP-1 is dual-mapped into workspace 0, but we want
-                // AI workspace scanned out on the laptop panel. AI's Space isn't pre-mapped
-                // with eDP-1 at bootstrap (only the virtual export Output is — see udev.rs
-                // :550-554). Inject eDP-1 here; map_output is idempotent so this is safe
-                // frame-to-frame. Future polish (map once at active_workspace swap, not
-                // per-frame) is tracked as v_future and does not block Gate 1 because
-                // Copilot mode is not exercised by the Gate 1 test.
-                if let Some(ai_space) = self.workspaces.get_space_mut(active_ws) {
-                    ai_space.map_output(&output, (0, 0));
-                }
-                (active_ws, true)
-            }
-            _ => (0, false),
-        };
-        let pointer_loc = if render_space_is_ai {
-            self.ai_pointer.current_location()
-        } else {
-            self.human_pointer.current_location()
-        };
+        // Phase 3 TASK 5: per-output Space routing without active_workspace
+        // branching. HDMI's Output is in HDMI's connector Workspace; eDP-1's
+        // Output is dual-mapped into workspace 0 (Vec-index 0 wins the linear
+        // scan in workspace_for_output) so the laptop panel keeps rendering
+        // the desktop windows. Copilot fall-through removed per D3 evidence
+        // (zero in-tree IPC Switch callers — Copilot dormant). If post-demo
+        // evidence emerges, formalize inside axis as a follow-on scope.
+        let render_ws_id = self.workspaces.workspace_for_output(&output).unwrap_or(0);
         let space = self.workspaces.get_space(render_ws_id).unwrap_or_else(|| self.workspaces.space());
-        let cursor_status = if render_space_is_ai {
-            &mut self.ai_cursor_status
-        } else {
-            &mut self.cursor_status
-        };
+        let pointer_loc = self.human_pointer.current_location();
+        let cursor_status = &mut self.cursor_status;
         let result = render_surface(
             surface,
             &mut renderer,
@@ -1590,8 +1547,8 @@ impl AnvilState<UdevData> {
             &mut self.backend_data.pointer_element,
             &self.dnd_icon,
             cursor_status,
-            if render_space_is_ai { false } else { self.show_window_preview },
-            if render_space_is_ai { None } else { self.snap_preview.as_ref() },
+            self.show_window_preview,
+            self.snap_preview.as_ref(),
         );
 
         // Process pending mirror frames for AI workspaces (ext-image-copy-capture clients)
