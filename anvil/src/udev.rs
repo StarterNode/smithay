@@ -1544,25 +1544,37 @@ impl AnvilState<UdevData> {
                 buffer
             });
 
-        // Display swap: render the active workspace's Space to the physical output.
-        // When active_workspace == 0 (default): render desktop.
-        // When active_workspace == N: render AI workspace (Chromium fullscreen, no layer-shell).
+        // Per-Output Space routing (COMPSTR-OUTPUT-SPACES-001 Phase 1 Task 8a):
+        // Each physical connector has its own Workspace (via WorkspaceManager::register_output).
+        // Render the Workspace owning THIS connector's Output so HDMI renders HDMI's Space,
+        // not workspace 0's. The dual-mapped case (eDP-1 in both workspace 0 AND its own
+        // Workspace) resolves to workspace 0 by Vec-index order, which falls through to the
+        // active_workspace selection so Copilot-mode swap still works on the laptop panel.
+        let owning_ws = self.workspaces.workspace_for_output(&output);
         let active_ws = self.workspaces.active_workspace();
-        let (render_space_is_ai, pointer_loc) = if active_ws != 0 {
-            // Map physical output to AI workspace's Space so space_render_elements works.
-            // map_output is idempotent — safe to call every frame.
-            if let Some(ai_space) = self.workspaces.get_space_mut(active_ws) {
-                ai_space.map_output(&output, (0, 0));
+        let (render_ws_id, render_space_is_ai) = match owning_ws {
+            Some(ws_id) if ws_id != 0 => (ws_id, false),
+            _ if active_ws != 0 => {
+                // Copilot fall-through: eDP-1 is dual-mapped into workspace 0, but we want
+                // AI workspace scanned out on the laptop panel. AI's Space isn't pre-mapped
+                // with eDP-1 at bootstrap (only the virtual export Output is — see udev.rs
+                // :550-554). Inject eDP-1 here; map_output is idempotent so this is safe
+                // frame-to-frame. Future polish (map once at active_workspace swap, not
+                // per-frame) is tracked as v_future and does not block Gate 1 because
+                // Copilot mode is not exercised by the Gate 1 test.
+                if let Some(ai_space) = self.workspaces.get_space_mut(active_ws) {
+                    ai_space.map_output(&output, (0, 0));
+                }
+                (active_ws, true)
             }
-            (true, self.ai_pointer.current_location())
-        } else {
-            (false, self.human_pointer.current_location())
+            _ => (0, false),
         };
-        let space = if active_ws != 0 {
-            self.workspaces.get_space(active_ws).unwrap_or_else(|| self.workspaces.space())
+        let pointer_loc = if render_space_is_ai {
+            self.ai_pointer.current_location()
         } else {
-            self.workspaces.space()
+            self.human_pointer.current_location()
         };
+        let space = self.workspaces.get_space(render_ws_id).unwrap_or_else(|| self.workspaces.space());
         let cursor_status = if render_space_is_ai {
             &mut self.ai_cursor_status
         } else {
