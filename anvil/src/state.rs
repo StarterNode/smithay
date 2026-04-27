@@ -804,58 +804,18 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
     }
 
     fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
-        use smithay::output::WeakOutput;
-        let weak_output = source.user_data().get::<WeakOutput>()?;
-        let output = weak_output.upgrade()?;
-        let mode = output.current_mode()?;
-
-        Some(BufferConstraints {
-            size: mode
-                .size
-                .to_logical(1)
-                .to_buffer(1, smithay::utils::Transform::Normal),
-            shm: vec![
-                smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
-                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
-            ],
-            #[cfg(any(feature = "udev", feature = "winit", feature = "x11"))]
-            dma: None,
-        })
+        compstr::screen::capture::build_buffer_constraints(
+            source,
+            self.backend_data.capture_dmabuf_constraints(),
+        )
     }
 
     fn new_session(&mut self, session: Session) {
-        // Must store the Session to prevent Drop from sending stopped to the client.
-        self.mirror.track_session(session);
+        compstr::screen::capture::handle_new_session(&mut self.mirror, session);
     }
 
     fn frame(&mut self, session: &SessionRef, frame: Frame) {
-        use smithay::output::WeakOutput;
-
-        // Resolve the session's capture source to an Output
-        let source = session.source();
-        let weak_output = match source.user_data().get::<WeakOutput>() {
-            Some(wo) => wo,
-            None => {
-                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
-                return;
-            }
-        };
-        let output = match weak_output.upgrade() {
-            Some(o) => o,
-            None => {
-                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
-                return;
-            }
-        };
-
-        // Check if this output belongs to an AI workspace mirror
-        if let Some(workspace_id) = self.mirror.workspace_for_output(&output) {
-            // Queue for rendering during the next render loop pass
-            self.mirror.queue_frame(workspace_id, frame);
-        } else {
-            // Physical output capture (e.g. grim screenshot of eDP-1)
-            self.mirror.queue_physical_frame(output, frame);
-        }
+        compstr::screen::capture::handle_frame_request(&mut self.mirror, session, frame);
     }
 }
 smithay::delegate_image_copy_capture!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -1480,4 +1440,14 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
     fn update_led_state(&mut self, led_state: LedState);
+
+    /// Backend-specific dmabuf constraints to advertise on
+    /// ext-image-copy-capture-v1 sessions. Default None for backends without
+    /// dmabuf support (winit, x11). Udev overrides with the renderer's
+    /// preferred format set + primary GPU node.
+    fn capture_dmabuf_constraints(
+        &self,
+    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
+        None
+    }
 }
