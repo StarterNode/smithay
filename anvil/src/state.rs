@@ -804,18 +804,18 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
     }
 
     fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
-        compstr::screen::capture::build_buffer_constraints(
+        compstr::mirror::build_buffer_constraints(
             source,
             self.backend_data.capture_dmabuf_constraints(),
         )
     }
 
     fn new_session(&mut self, session: Session) {
-        compstr::screen::capture::handle_new_session(&mut self.mirror, session);
+        compstr::mirror::handle_new_session(&mut self.mirror, session);
     }
 
     fn frame(&mut self, session: &SessionRef, frame: Frame) {
-        compstr::screen::capture::handle_frame_request(&mut self.mirror, session, frame);
+        compstr::mirror::handle_frame_request(&mut self.mirror, session, frame);
     }
 }
 smithay::delegate_image_copy_capture!(@<BackendData: Backend + 'static> AnvilState<BackendData>);

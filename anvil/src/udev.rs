@@ -2101,7 +2101,7 @@ fn render_physical_capture_frames(
     renderer: &mut UdevRenderer<'_>,
     space: &smithay::desktop::Space<WindowElement>,
     output: &Output,
-    pending: Vec<compstr::screen::mirror::PhysicalPendingFrame>,
+    pending: Vec<compstr::mirror::PhysicalPendingFrame>,
 ) {
     use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
     use smithay::backend::renderer::damage::OutputDamageTracker;
