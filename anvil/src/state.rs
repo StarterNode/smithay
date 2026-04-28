@@ -804,10 +804,7 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
     }
 
     fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
-        compstr::mirror::build_buffer_constraints(
-            source,
-            self.backend_data.capture_dmabuf_constraints(),
-        )
+        compstr::mirror::build_buffer_constraints(source)
     }
 
     fn new_session(&mut self, session: Session) {
@@ -1440,14 +1437,4 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
     fn update_led_state(&mut self, led_state: LedState);
-
-    /// Backend-specific dmabuf constraints to advertise on
-    /// ext-image-copy-capture-v1 sessions. Default None for backends without
-    /// dmabuf support (winit, x11). Udev overrides with the renderer's
-    /// preferred format set + primary GPU node.
-    fn capture_dmabuf_constraints(
-        &self,
-    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
-        None
-    }
 }

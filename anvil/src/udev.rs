@@ -147,10 +147,6 @@ pub struct UdevData {
     /// Double-buffered offscreen textures for cockpit DMA-BUF export.
     /// Allocated once on first export, reused across frames.
     export_buffers: [Option<GlesTexture>; 2],
-    /// Renderer's preferred dmabuf format set, captured at dmabuf init.
-    /// Read by Backend::capture_dmabuf_constraints to advertise on
-    /// ext-image-copy-capture-v1 sessions.
-    capture_formats: Option<FormatSet>,
 }
 
 impl UdevData {
@@ -222,23 +218,6 @@ impl Backend for UdevData {
             keyboard.led_update(led_state.into());
         }
     }
-
-    fn capture_dmabuf_constraints(
-        &self,
-    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
-        let format_set = self.capture_formats.as_ref()?;
-        let mut grouped: HashMap<Fourcc, Vec<Modifier>> = HashMap::new();
-        for f in format_set.iter() {
-            grouped.entry(f.code).or_default().push(f.modifier);
-        }
-        if grouped.is_empty() {
-            return None;
-        }
-        Some(smithay::wayland::image_copy_capture::DmabufConstraints {
-            node: self.primary_gpu,
-            formats: grouped.into_iter().collect(),
-        })
-    }
 }
 
 pub fn run_udev() {
@@ -302,7 +281,6 @@ pub fn run_udev() {
         debug_flags: DebugFlags::empty(),
         keyboards: Vec::new(),
         export_buffers: [None, None],
-        capture_formats: None,
     };
     let mut state = AnvilState::init(display, event_loop.handle(), data, true);
 
@@ -477,7 +455,6 @@ pub fn run_udev() {
 
     // init dmabuf support with format list from our primary gpu
     let dmabuf_formats = renderer.dmabuf_formats();
-    state.backend_data.capture_formats = Some(dmabuf_formats.clone());
     let default_feedback = DmabufFeedbackBuilder::new(primary_gpu.dev_id(), dmabuf_formats)
         .build()
         .unwrap();
