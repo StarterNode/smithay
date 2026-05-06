@@ -541,7 +541,7 @@ pub fn run_udev() {
         warn!("Failed to notify systemd: {}", e);
     }
 
-    // Create AI workspace (workspace 1) + spawn desktop server + Chromium kiosk
+    // Create AI workspace (workspace 1) + spawn Chromium kiosk
     let ai_ws = state.workspaces.create("ai");
     info!("Created AI workspace {}", ai_ws);
 
@@ -555,19 +555,18 @@ pub fn run_udev() {
 
     let ai_socket = state.ensure_workspace_socket(ai_ws);
 
-    // Desktop server — serves the AI desktop HTML page on localhost:9100
-    match std::process::Command::new("/usr/local/bin/desktop").spawn() {
-        Ok(child) => info!("Spawned desktop server (pid {})", child.id()),
-        Err(e) => error!("Failed to spawn desktop server: {}", e),
-    }
-
-    // Chromium kiosk on workspace 1 — loads AI desktop, gives compstr something to export
+    // Chromium kiosk on workspace 1 — loads AI desktop from systemd-managed guide-server,
+    // gives compstr something to export. guide-server.service is up before anvil per
+    // After=network-online.target / WantedBy=multi-user.target.
+    // Kiosk profile lives at /var/kiosk/aidesktop (created by anvil-packaging postinst).
     match std::process::Command::new("chromium")
         .args(&[
-            "--kiosk", "--no-first-run", "--disable-infobars",
-            "--ozone-platform=wayland", "--remote-debugging-port=9222",
-            &format!("--user-data-dir=/tmp/chromium-cockpit-{}", ai_ws),
-            "--app=http://localhost:9100",
+            "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
+            "--enable-features=UseOzonePlatform", "--ozone-platform=wayland",
+            "--remote-debugging-port=9222",
+            "--class=manji.aidesktop",
+            "--user-data-dir=/var/kiosk/aidesktop",
+            "--app=http://127.0.0.1:9100/",
         ])
         .env("WAYLAND_DISPLAY", &ai_socket)
         .spawn()
