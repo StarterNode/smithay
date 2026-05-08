@@ -34,6 +34,27 @@ impl<BackendData: Backend + 'static> IpcHandler for AnvilState<BackendData> {
     }
 }
 
+/// Pointer event variant — selects which sequence dispatch_pointer_event runs.
+/// Click = atomic press+release. MouseDown = press only. MouseUp = release only —
+/// MouseUp relies on the implicit grab established by a prior MouseDown's Pressed
+/// call to route the event to the press-owning surface, so MouseUp passes None
+/// as the focus argument and skips the hit-test.
+enum PointerOp {
+    Click,
+    MouseDown,
+    MouseUp,
+}
+
+impl PointerOp {
+    fn name(&self) -> &'static str {
+        match self {
+            PointerOp::Click => "click",
+            PointerOp::MouseDown => "mouse_down",
+            PointerOp::MouseUp => "mouse_up",
+        }
+    }
+}
+
 impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     /// COCKPIT-050-G1: Resolve target workspace for input commands.
     /// If workspace is Some, use it. Otherwise find the first AI workspace (id > 0).
@@ -61,6 +82,144 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             }
         }
         None
+    }
+
+    /// Dispatch a pointer event (Click / MouseDown / MouseUp) on the AI seat.
+    /// Wayland implicit-grab semantics: the compositor maintains an implicit
+    /// grab from button(Pressed) until button(Released), and motion + release
+    /// events route to the press-owning surface regardless of cursor position.
+    /// MouseUp passes focus=None to ai_pointer.motion and skips the hit-test;
+    /// Smithay routes through whatever grab is active. The Move IpcCommand
+    /// arm follows the same pattern during a held-button window.
+    fn dispatch_pointer_event(
+        &mut self,
+        x: f64,
+        y: f64,
+        button: &str,
+        workspace: Option<WorkspaceId>,
+        op: PointerOp,
+    ) -> Value {
+        let ws_id = match self.resolve_input_workspace(workspace) {
+            Some(id) => id,
+            None => return ipc::error_response(
+                &format!("no AI workspace found for {}", op.name()),
+            ),
+        };
+        let pos: Point<f64, Logical> = (x, y).into();
+        let time = 0u32;
+
+        let pointer = self.ai_pointer.clone();
+
+        // Hit-test on Click + MouseDown only. MouseUp passes None — implicit
+        // grab carries the release to the press-owner.
+        let under = match op {
+            PointerOp::Click | PointerOp::MouseDown => {
+                self.workspaces.get_space(ws_id).and_then(|space| {
+                    space.element_under(pos).and_then(|(window, loc)| {
+                        window
+                            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+                            .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
+                    })
+                })
+            }
+            PointerOp::MouseUp => None,
+        };
+        info!("IPC: {} hit-test under={}", op.name(), under.is_some());
+
+        // Motion event — focus arg is `under` for Click+MouseDown, None for MouseUp.
+        let serial = SCOUNTER.next_serial();
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+
+        // Map button name to evdev code
+        let button_code: u32 = match button {
+            "left" => 0x110,    // BTN_LEFT
+            "right" => 0x111,   // BTN_RIGHT
+            "middle" => 0x112,  // BTN_MIDDLE
+            _ => 0x110,
+        };
+
+        // Op-specific button sequence
+        match op {
+            PointerOp::Click => {
+                // Press
+                let serial = SCOUNTER.next_serial();
+                pointer.button(self, &ButtonEvent {
+                    button: button_code,
+                    state: smithay::backend::input::ButtonState::Pressed,
+                    serial,
+                    time,
+                });
+                pointer.frame(self);
+                // Release
+                let serial = SCOUNTER.next_serial();
+                pointer.button(self, &ButtonEvent {
+                    button: button_code,
+                    state: smithay::backend::input::ButtonState::Released,
+                    serial,
+                    time: time + 50,
+                });
+                pointer.frame(self);
+                // Set keyboard focus on the clicked window
+                if let Some(space) = self.workspaces.get_space(ws_id) {
+                    if let Some((window, _)) = space.element_under(pos).map(|(w, p)| (w.clone(), p)) {
+                        if let Some(keyboard) = self.ai_seat.get_keyboard() {
+                            keyboard.set_focus(self, Some(window.into()), serial);
+                        }
+                    }
+                }
+            }
+            PointerOp::MouseDown => {
+                // Press only — Released will arrive as a separate MouseUp IPC.
+                let serial = SCOUNTER.next_serial();
+                pointer.button(self, &ButtonEvent {
+                    button: button_code,
+                    state: smithay::backend::input::ButtonState::Pressed,
+                    serial,
+                    time,
+                });
+                pointer.frame(self);
+                // Set keyboard focus on the press target so a press-without-immediate-release
+                // (drag start) establishes the same focus state as a tap.
+                if let Some(space) = self.workspaces.get_space(ws_id) {
+                    if let Some((window, _)) = space.element_under(pos).map(|(w, p)| (w.clone(), p)) {
+                        if let Some(keyboard) = self.ai_seat.get_keyboard() {
+                            keyboard.set_focus(self, Some(window.into()), serial);
+                        }
+                    }
+                }
+            }
+            PointerOp::MouseUp => {
+                // Release only — implicit grab routes this to the press-owner.
+                // No set_focus: release shouldn't shift focus, and the grab is broken
+                // by the Released call regardless.
+                let serial = SCOUNTER.next_serial();
+                pointer.button(self, &ButtonEvent {
+                    button: button_code,
+                    state: smithay::backend::input::ButtonState::Released,
+                    serial,
+                    time,
+                });
+                pointer.frame(self);
+            }
+        }
+
+        info!("IPC: {} at ({}, {}) button={} workspace={}", op.name(), x, y, button, ws_id);
+        ipc::success(json!({
+            "action": op.name(),
+            "x": x,
+            "y": y,
+            "button": button,
+            "workspace": ws_id,
+        }))
     }
 
     fn handle_ipc_command(&mut self, cmd: IpcCommand) -> Value {
@@ -153,83 +312,15 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             }
 
             IpcCommand::Click { x, y, button, workspace } => {
-                let ws_id = match self.resolve_input_workspace(workspace) {
-                    Some(id) => id,
-                    None => return ipc::error_response("no AI workspace found for click"),
-                };
-                let pos: Point<f64, Logical> = (x, y).into();
-                let time = 0u32;
+                self.dispatch_pointer_event(x, y, &button, workspace, PointerOp::Click)
+            }
 
-                let pointer = self.ai_pointer.clone();
+            IpcCommand::MouseDown { x, y, button, workspace } => {
+                self.dispatch_pointer_event(x, y, &button, workspace, PointerOp::MouseDown)
+            }
 
-                // Hit-test target workspace
-                let under = self.workspaces.get_space(ws_id).and_then(|space| {
-                    space.element_under(pos).and_then(|(window, loc)| {
-                        window
-                            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-                            .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
-                    })
-                });
-                info!("IPC: click hit-test under={}", under.is_some());
-
-                // Move pointer to position
-                let serial = SCOUNTER.next_serial();
-                pointer.motion(
-                    self,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time,
-                    },
-                );
-                pointer.frame(self);
-
-                // Map button name to code
-                let button_code: u32 = match button.as_str() {
-                    "left" => 0x110,    // BTN_LEFT
-                    "right" => 0x111,   // BTN_RIGHT
-                    "middle" => 0x112,  // BTN_MIDDLE
-                    _ => 0x110,
-                };
-
-                // Press
-                let serial = SCOUNTER.next_serial();
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: button_code,
-                        state: smithay::backend::input::ButtonState::Pressed,
-                        serial,
-                        time,
-                    },
-                );
-                pointer.frame(self);
-
-                // Release
-                let serial = SCOUNTER.next_serial();
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: button_code,
-                        state: smithay::backend::input::ButtonState::Released,
-                        serial,
-                        time: time + 50,
-                    },
-                );
-                pointer.frame(self);
-
-                // Set keyboard focus on the clicked window
-                if let Some(space) = self.workspaces.get_space(ws_id) {
-                    if let Some((window, _)) = space.element_under(pos).map(|(w, p)| (w.clone(), p)) {
-                        if let Some(keyboard) = self.ai_seat.get_keyboard() {
-                            keyboard.set_focus(self, Some(window.into()), serial);
-                        }
-                    }
-                }
-
-                info!("IPC: click at ({}, {}) button={} workspace={}", x, y, button, ws_id);
-                ipc::success(json!({"action": "click", "x": x, "y": y, "button": button, "workspace": ws_id}))
+            IpcCommand::MouseUp { x, y, button, workspace } => {
+                self.dispatch_pointer_event(x, y, &button, workspace, PointerOp::MouseUp)
             }
 
             IpcCommand::Move { x, y, workspace } => {
