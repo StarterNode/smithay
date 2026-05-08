@@ -45,9 +45,18 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             }
             return None;
         }
-        // No workspace specified — find first AI workspace (id > 0)
+        // Workspaces with id > 0 may be physical-output-mapped (e.g. "HDMI-A-2"),
+        // not the AI workspace. Match by name first to avoid dispatching input
+        // to an empty output-mapped space.
+        for ws in self.workspaces.list() {
+            if ws.name == "ai" && self.workspaces.get_space(ws.id).is_some() {
+                info!("IPC: resolve_input_workspace -> by name 'ai' id={}", ws.id);
+                return Some(ws.id);
+            }
+        }
         for ws in self.workspaces.list() {
             if ws.id > 0 && self.workspaces.get_space(ws.id).is_some() {
+                info!("IPC: resolve_input_workspace -> fallback id>0 id={} name={}", ws.id, ws.name);
                 return Some(ws.id);
             }
         }
@@ -161,6 +170,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                             .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
                     })
                 });
+                info!("IPC: click hit-test under={}", under.is_some());
 
                 // Move pointer to position
                 let serial = SCOUNTER.next_serial();
