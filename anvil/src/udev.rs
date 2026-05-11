@@ -544,6 +544,9 @@ pub fn run_udev() {
     // Create AI workspace (workspace 1) + spawn Chromium kiosk
     let ai_ws = state.workspaces.create("ai");
     info!("Created AI workspace {}", ai_ws);
+    // COMPSTR-AI-SEAT-LATENCY-002 phase 2.H: populate compstr's input routing
+    // cache (QW3) so handle_input's resolver short-circuits on every Move event.
+    state.input_routing_cache.set_ai_workspace(ai_ws);
 
     // Map export virtual output (1920x1080) to workspace 1 BEFORE Chromium spawn.
     // xdg.rs needs this output to give Chromium the correct Fullscreen geometry.
