@@ -219,6 +219,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // IPC — workspace-specific Wayland sockets for client tagging
     pub workspace_sockets: HashMap<crate::workspace::WorkspaceId, String>,
+
+    // QW3 cache for INPUT IpcCommand routing — owned by compstr (COMPSTR-AI-SEAT-LATENCY-002).
+    pub input_routing_cache: compstr::ipc::cache::InputRoutingCache,
 }
 
 #[derive(Debug)]
@@ -1000,6 +1003,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             snap_preview: None,
 
             workspace_sockets: HashMap::new(),
+            input_routing_cache: compstr::ipc::cache::InputRoutingCache::new(),
         };
 
         // Set up IPC for workspace commands (/var/anvil/cmd/ → inotify)

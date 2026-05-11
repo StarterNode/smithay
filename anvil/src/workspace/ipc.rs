@@ -1,18 +1,17 @@
 //! IPC command execution — anvil side.
 //!
 //! Types, parsing, file I/O, and inotify setup live in compstr::ipc.
-//! This module implements command dispatch on AnvilState (needs compositor state).
+//! INPUT-variant dispatch (Click, MouseDown, MouseUp, Move, Scroll, Key, Type)
+//! moved to compstr::ipc::dispatch::handle_input in COMPSTR-AI-SEAT-LATENCY-002
+//! phase 2.D — anvil only retains non-INPUT command execution here (workspace
+//! lifecycle: Create / Destroy / Subscribe / Unsubscribe / List / Switch / Spawn).
+//! The IpcHandler::dispatch_input_ipc_command override + file-IPC INPUT-arm
+//! delegation to handle_input land in phase 2.G.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
-
-use smithay::input::keyboard::{FilterResult, Keycode};
-use smithay::backend::input::KeyState;
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
-use smithay::backend::input::{Axis, AxisSource};
-use smithay::utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER};
 
 use compstr::ipc::{self, IpcCommand, IpcHandler};
 use compstr::workspace::WorkspaceId;
@@ -32,196 +31,16 @@ impl<BackendData: Backend + 'static> IpcHandler for AnvilState<BackendData> {
             }
         }
     }
-}
 
-/// Pointer event variant — selects which sequence dispatch_pointer_event runs.
-/// Click = atomic press+release. MouseDown = press only. MouseUp = release only —
-/// MouseUp relies on the implicit grab established by a prior MouseDown's Pressed
-/// call to route the event to the press-owning surface, so MouseUp passes None
-/// as the focus argument and skips the hit-test.
-enum PointerOp {
-    Click,
-    MouseDown,
-    MouseUp,
-}
-
-impl PointerOp {
-    fn name(&self) -> &'static str {
-        match self {
-            PointerOp::Click => "click",
-            PointerOp::MouseDown => "mouse_down",
-            PointerOp::MouseUp => "mouse_up",
-        }
+    /// COMPSTR-AI-SEAT-LATENCY-002 phase 2.G: socket-transport INPUT dispatch
+    /// delegates to compstr's owned handler. One-line thin hook per CEO ruling
+    /// 2026-05-10 — compstr owns the dispatch logic; anvil owns CompositorOps.
+    fn dispatch_input_ipc_command(&mut self, cmd: IpcCommand) {
+        compstr::ipc::handle_input(self, cmd);
     }
 }
 
 impl<BackendData: Backend + 'static> AnvilState<BackendData> {
-    /// COCKPIT-050-G1: Resolve target workspace for input commands.
-    /// If workspace is Some, use it. Otherwise find the first AI workspace (id > 0).
-    /// Falls back to workspace 1 for backwards compatibility.
-    fn resolve_input_workspace(&self, workspace: Option<WorkspaceId>) -> Option<WorkspaceId> {
-        if let Some(id) = workspace {
-            if self.workspaces.get_space(id).is_some() {
-                return Some(id);
-            }
-            return None;
-        }
-        // Workspaces with id > 0 may be physical-output-mapped (e.g. "HDMI-A-2"),
-        // not the AI workspace. Match by name first to avoid dispatching input
-        // to an empty output-mapped space.
-        for ws in self.workspaces.list() {
-            if ws.name == "ai" && self.workspaces.get_space(ws.id).is_some() {
-                info!("IPC: resolve_input_workspace -> by name 'ai' id={}", ws.id);
-                return Some(ws.id);
-            }
-        }
-        for ws in self.workspaces.list() {
-            if ws.id > 0 && self.workspaces.get_space(ws.id).is_some() {
-                info!("IPC: resolve_input_workspace -> fallback id>0 id={} name={}", ws.id, ws.name);
-                return Some(ws.id);
-            }
-        }
-        None
-    }
-
-    /// Dispatch a pointer event (Click / MouseDown / MouseUp) on the AI seat.
-    /// Wayland implicit-grab semantics: the compositor maintains an implicit
-    /// grab from button(Pressed) until button(Released), and motion + release
-    /// events route to the press-owning surface regardless of cursor position.
-    /// MouseUp passes focus=None to ai_pointer.motion and skips the hit-test;
-    /// Smithay routes through whatever grab is active. The Move IpcCommand
-    /// arm follows the same pattern during a held-button window.
-    fn dispatch_pointer_event(
-        &mut self,
-        x: f64,
-        y: f64,
-        button: &str,
-        workspace: Option<WorkspaceId>,
-        op: PointerOp,
-    ) -> Value {
-        let ws_id = match self.resolve_input_workspace(workspace) {
-            Some(id) => id,
-            None => return ipc::error_response(
-                &format!("no AI workspace found for {}", op.name()),
-            ),
-        };
-        let pos: Point<f64, Logical> = (x, y).into();
-        let time = 0u32;
-
-        let pointer = self.ai_pointer.clone();
-
-        // Hit-test on Click + MouseDown only. MouseUp passes None — implicit
-        // grab carries the release to the press-owner.
-        let under = match op {
-            PointerOp::Click | PointerOp::MouseDown => {
-                self.workspaces.get_space(ws_id).and_then(|space| {
-                    space.element_under(pos).and_then(|(window, loc)| {
-                        window
-                            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-                            .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
-                    })
-                })
-            }
-            PointerOp::MouseUp => None,
-        };
-        info!("IPC: {} hit-test under={}", op.name(), under.is_some());
-
-        // Motion event — focus arg is `under` for Click+MouseDown, None for MouseUp.
-        let serial = SCOUNTER.next_serial();
-        pointer.motion(
-            self,
-            under,
-            &MotionEvent {
-                location: pos,
-                serial,
-                time,
-            },
-        );
-        pointer.frame(self);
-
-        // Map button name to evdev code
-        let button_code: u32 = match button {
-            "left" => 0x110,    // BTN_LEFT
-            "right" => 0x111,   // BTN_RIGHT
-            "middle" => 0x112,  // BTN_MIDDLE
-            _ => 0x110,
-        };
-
-        // Op-specific button sequence
-        match op {
-            PointerOp::Click => {
-                // Press
-                let serial = SCOUNTER.next_serial();
-                pointer.button(self, &ButtonEvent {
-                    button: button_code,
-                    state: smithay::backend::input::ButtonState::Pressed,
-                    serial,
-                    time,
-                });
-                pointer.frame(self);
-                // Release
-                let serial = SCOUNTER.next_serial();
-                pointer.button(self, &ButtonEvent {
-                    button: button_code,
-                    state: smithay::backend::input::ButtonState::Released,
-                    serial,
-                    time: time + 50,
-                });
-                pointer.frame(self);
-                // Set keyboard focus on the clicked window
-                if let Some(space) = self.workspaces.get_space(ws_id) {
-                    if let Some((window, _)) = space.element_under(pos).map(|(w, p)| (w.clone(), p)) {
-                        if let Some(keyboard) = self.ai_seat.get_keyboard() {
-                            keyboard.set_focus(self, Some(window.into()), serial);
-                        }
-                    }
-                }
-            }
-            PointerOp::MouseDown => {
-                // Press only — Released will arrive as a separate MouseUp IPC.
-                let serial = SCOUNTER.next_serial();
-                pointer.button(self, &ButtonEvent {
-                    button: button_code,
-                    state: smithay::backend::input::ButtonState::Pressed,
-                    serial,
-                    time,
-                });
-                pointer.frame(self);
-                // Set keyboard focus on the press target so a press-without-immediate-release
-                // (drag start) establishes the same focus state as a tap.
-                if let Some(space) = self.workspaces.get_space(ws_id) {
-                    if let Some((window, _)) = space.element_under(pos).map(|(w, p)| (w.clone(), p)) {
-                        if let Some(keyboard) = self.ai_seat.get_keyboard() {
-                            keyboard.set_focus(self, Some(window.into()), serial);
-                        }
-                    }
-                }
-            }
-            PointerOp::MouseUp => {
-                // Release only — implicit grab routes this to the press-owner.
-                // No set_focus: release shouldn't shift focus, and the grab is broken
-                // by the Released call regardless.
-                let serial = SCOUNTER.next_serial();
-                pointer.button(self, &ButtonEvent {
-                    button: button_code,
-                    state: smithay::backend::input::ButtonState::Released,
-                    serial,
-                    time,
-                });
-                pointer.frame(self);
-            }
-        }
-
-        info!("IPC: {} at ({}, {}) button={} workspace={}", op.name(), x, y, button, ws_id);
-        ipc::success(json!({
-            "action": op.name(),
-            "x": x,
-            "y": y,
-            "button": button,
-            "workspace": ws_id,
-        }))
-    }
-
     fn handle_ipc_command(&mut self, cmd: IpcCommand) -> Value {
         match cmd {
             IpcCommand::Create { name } => {
@@ -311,263 +130,6 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 }
             }
 
-            IpcCommand::Click { x, y, button, workspace } => {
-                self.dispatch_pointer_event(x, y, &button, workspace, PointerOp::Click)
-            }
-
-            IpcCommand::MouseDown { x, y, button, workspace } => {
-                self.dispatch_pointer_event(x, y, &button, workspace, PointerOp::MouseDown)
-            }
-
-            IpcCommand::MouseUp { x, y, button, workspace } => {
-                self.dispatch_pointer_event(x, y, &button, workspace, PointerOp::MouseUp)
-            }
-
-            IpcCommand::Move { x, y, workspace } => {
-                let ws_id = match self.resolve_input_workspace(workspace) {
-                    Some(id) => id,
-                    None => return ipc::error_response("no AI workspace found for move"),
-                };
-                let pos: Point<f64, Logical> = (x, y).into();
-
-                let pointer = self.ai_pointer.clone();
-
-                // Hit-test target workspace
-                let under = self.workspaces.get_space(ws_id).and_then(|space| {
-                    space.element_under(pos).and_then(|(window, loc)| {
-                        window
-                            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-                            .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
-                    })
-                });
-
-                let serial = SCOUNTER.next_serial();
-                pointer.motion(
-                    self,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time: 0,
-                    },
-                );
-                pointer.frame(self);
-
-                info!("IPC: move to ({}, {})", x, y);
-                ipc::success(json!({"action": "move", "x": x, "y": y}))
-            }
-
-            IpcCommand::Key { key, workspace } => {
-                let ws_id = match self.resolve_input_workspace(workspace) {
-                    Some(id) => id,
-                    None => return ipc::error_response("no AI workspace found for key"),
-                };
-                let keyboard = match self.ai_seat.get_keyboard() {
-                    Some(k) => k,
-                    None => return ipc::error_response("AI seat has no keyboard"),
-                };
-
-                // Ensure keyboard focus on target workspace window
-                if let Some(space) = self.workspaces.get_space(ws_id) {
-                    if let Some((window, _)) = space.element_under(
-                        self.ai_pointer.current_location()
-                    ).map(|(w, p)| (w.clone(), p)) {
-                        let serial = SCOUNTER.next_serial();
-                        keyboard.set_focus(self, Some(window.into()), serial);
-                    }
-                }
-
-                // Parse modifier combo (e.g. "ctrl+l" → mods + key)
-                let parts: Vec<&str> = key.split('+').collect();
-                let key_name = parts.last().unwrap_or(&"");
-                let mut mod_keycodes: Vec<u32> = Vec::new();
-
-                for part in &parts[..parts.len().saturating_sub(1)] {
-                    let kc = match part.to_lowercase().as_str() {
-                        "ctrl" | "control" => 37, // evdev KEY_LEFTCTRL
-                        "alt" => 64,              // evdev KEY_LEFTALT
-                        "shift" => 50,            // evdev KEY_LEFTSHIFT
-                        "super" | "win" | "meta" => 133, // evdev KEY_LEFTMETA
-                        _ => continue,
-                    };
-                    mod_keycodes.push(kc);
-                }
-
-                // Map key name to evdev keycode
-                let keycode: u32 = match key_name.to_lowercase().as_str() {
-                    "return" | "enter" => 36,
-                    "tab" => 23,
-                    "escape" | "esc" => 9,
-                    "backspace" => 22,
-                    "delete" | "del" => 119,
-                    "space" => 65,
-                    "up" => 111, "down" => 116, "left" => 113, "right" => 114,
-                    "home" => 110, "end" => 115,
-                    "pageup" | "page_up" => 112, "pagedown" | "page_down" => 117,
-                    "f1" => 67, "f2" => 68, "f3" => 69, "f4" => 70,
-                    "f5" => 71, "f6" => 72, "f7" => 73, "f8" => 74,
-                    "f9" => 75, "f10" => 76, "f11" => 95, "f12" => 96,
-                    s if s.len() == 1 => {
-                        let ch = s.chars().next().unwrap();
-                        match ch {
-                            'a' => 38, 'b' => 56, 'c' => 54, 'd' => 40, 'e' => 26,
-                            'f' => 41, 'g' => 42, 'h' => 43, 'i' => 31, 'j' => 44,
-                            'k' => 45, 'l' => 46, 'm' => 58, 'n' => 57, 'o' => 32,
-                            'p' => 33, 'q' => 24, 'r' => 27, 's' => 39, 't' => 28,
-                            'u' => 30, 'v' => 55, 'w' => 25, 'x' => 53, 'y' => 29,
-                            'z' => 52,
-                            '0' => 19, '1' => 10, '2' => 11, '3' => 12,
-                            '4' => 13, '5' => 14, '6' => 15, '7' => 16,
-                            '8' => 17, '9' => 18,
-                            '/' => 61, '.' => 60, ',' => 59, ';' => 47,
-                            '\'' => 48, '[' => 34, ']' => 35, '-' => 20,
-                            '=' => 21, '\\' => 51, '`' => 49,
-                            _ => return ipc::error_response(&format!("unknown key: {}", key)),
-                        }
-                    }
-                    "l" => 46,
-                    _ => return ipc::error_response(&format!("unknown key: {}", key)),
-                };
-
-                let serial = SCOUNTER.next_serial();
-
-                // Press modifiers
-                for &mc in &mod_keycodes {
-                    keyboard.input::<(), _>(self, Keycode::new(mc), KeyState::Pressed, serial, 0, |_, _, _| {
-                        FilterResult::Forward
-                    });
-                }
-
-                // Press + release main key
-                keyboard.input::<(), _>(self, Keycode::new(keycode), KeyState::Pressed, serial, 0, |_, _, _| {
-                    FilterResult::Forward
-                });
-                keyboard.input::<(), _>(self, Keycode::new(keycode), KeyState::Released, serial, 0, |_, _, _| {
-                    FilterResult::Forward
-                });
-
-                // Release modifiers
-                for &mc in mod_keycodes.iter().rev() {
-                    keyboard.input::<(), _>(self, Keycode::new(mc), KeyState::Released, serial, 0, |_, _, _| {
-                        FilterResult::Forward
-                    });
-                }
-
-                info!("IPC: key '{}'", key);
-                ipc::success(json!({"action": "key", "key": key}))
-            }
-
-            IpcCommand::Type { text, workspace } => {
-                let ws_id = match self.resolve_input_workspace(workspace) {
-                    Some(id) => id,
-                    None => return ipc::error_response("no AI workspace found for type"),
-                };
-                let keyboard = match self.ai_seat.get_keyboard() {
-                    Some(k) => k,
-                    None => return ipc::error_response("AI seat has no keyboard"),
-                };
-
-                // Ensure keyboard focus on target workspace window
-                if let Some(space) = self.workspaces.get_space(ws_id) {
-                    if let Some((window, _)) = space.element_under(
-                        self.ai_pointer.current_location()
-                    ).map(|(w, p)| (w.clone(), p)) {
-                        let serial = SCOUNTER.next_serial();
-                        keyboard.set_focus(self, Some(window.into()), serial);
-                    }
-                }
-
-                for ch in text.chars() {
-                    let (keycode, needs_shift) = match ch {
-                        // XKB keycodes follow physical QWERTY layout, NOT alphabetical order
-                        'a' => (38, false), 'b' => (56, false), 'c' => (54, false),
-                        'd' => (40, false), 'e' => (26, false), 'f' => (41, false),
-                        'g' => (42, false), 'h' => (43, false), 'i' => (31, false),
-                        'j' => (44, false), 'k' => (45, false), 'l' => (46, false),
-                        'm' => (58, false), 'n' => (57, false), 'o' => (32, false),
-                        'p' => (33, false), 'q' => (24, false), 'r' => (27, false),
-                        's' => (39, false), 't' => (28, false), 'u' => (30, false),
-                        'v' => (55, false), 'w' => (25, false), 'x' => (53, false),
-                        'y' => (29, false), 'z' => (52, false),
-                        'A' => (38, true), 'B' => (56, true), 'C' => (54, true),
-                        'D' => (40, true), 'E' => (26, true), 'F' => (41, true),
-                        'G' => (42, true), 'H' => (43, true), 'I' => (31, true),
-                        'J' => (44, true), 'K' => (45, true), 'L' => (46, true),
-                        'M' => (58, true), 'N' => (57, true), 'O' => (32, true),
-                        'P' => (33, true), 'Q' => (24, true), 'R' => (27, true),
-                        'S' => (39, true), 'T' => (28, true), 'U' => (30, true),
-                        'V' => (55, true), 'W' => (25, true), 'X' => (53, true),
-                        'Y' => (29, true), 'Z' => (52, true),
-                        '0' => (19, false), '1' => (10, false), '2' => (11, false),
-                        '3' => (12, false), '4' => (13, false), '5' => (14, false),
-                        '6' => (15, false), '7' => (16, false), '8' => (17, false),
-                        '9' => (18, false),
-                        ' ' => (65, false),
-                        '.' => (60, false), ',' => (59, false), '/' => (61, false),
-                        ';' => (47, false), '\'' => (48, false),
-                        '-' => (20, false), '=' => (21, false),
-                        '[' => (34, false), ']' => (35, false),
-                        '\\' => (51, false), '`' => (49, false),
-                        ':' => (47, true), '"' => (48, true),
-                        '!' => (10, true), '@' => (11, true), '#' => (12, true),
-                        '$' => (13, true), '%' => (14, true), '^' => (15, true),
-                        '&' => (16, true), '*' => (17, true), '(' => (18, true),
-                        ')' => (19, true), '_' => (20, true), '+' => (21, true),
-                        '{' => (34, true), '}' => (35, true), '|' => (51, true),
-                        '~' => (49, true), '<' => (59, true), '>' => (60, true),
-                        '?' => (61, true),
-                        _ => continue,
-                    };
-
-                    let serial = SCOUNTER.next_serial();
-
-                    if needs_shift {
-                        keyboard.input::<(), _>(self, Keycode::new(50), KeyState::Pressed, serial, 0, |_, _, _| {
-                            FilterResult::Forward
-                        });
-                    }
-                    keyboard.input::<(), _>(self, Keycode::new(keycode), KeyState::Pressed, serial, 0, |_, _, _| {
-                        FilterResult::Forward
-                    });
-                    keyboard.input::<(), _>(self, Keycode::new(keycode), KeyState::Released, serial, 0, |_, _, _| {
-                        FilterResult::Forward
-                    });
-                    if needs_shift {
-                        keyboard.input::<(), _>(self, Keycode::new(50), KeyState::Released, serial, 0, |_, _, _| {
-                            FilterResult::Forward
-                        });
-                    }
-                }
-
-                info!("IPC: type '{}' ({} chars)", text, text.len());
-                ipc::success(json!({"action": "type", "text": text, "length": text.len()}))
-            }
-
-            IpcCommand::Scroll { direction, amount, workspace: _ } => {
-                // workspace field accepted for API consistency but scroll targets
-                // whatever surface has AI pointer focus (move pointer first — G6).
-                let pointer = self.ai_pointer.clone();
-                let multiplier = 15.0_f64;
-                let value = amount as f64 * multiplier;
-
-                let mut frame = AxisFrame::new(0).source(AxisSource::Wheel);
-                match direction.as_str() {
-                    "down" => { frame = frame.value(Axis::Vertical, value); }
-                    "up" => { frame = frame.value(Axis::Vertical, -value); }
-                    "right" => { frame = frame.value(Axis::Horizontal, value); }
-                    "left" => { frame = frame.value(Axis::Horizontal, -value); }
-                    _ => {
-                        return ipc::error_response(&format!("invalid scroll direction: {}", direction));
-                    }
-                }
-
-                pointer.axis(self, frame);
-                pointer.frame(self);
-
-                info!("IPC: scroll {} amount={}", direction, amount);
-                ipc::success(json!({"action": "scroll", "direction": direction, "amount": amount}))
-            }
-
             IpcCommand::Spawn { id, command, args } => {
                 if self.workspaces.get_space(id).is_none() {
                     return ipc::error_response(&format!("workspace {} not found", id));
@@ -597,6 +159,22 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                         ipc::error_response(&format!("spawn failed: {}", e))
                     }
                 }
+            }
+
+            // COMPSTR-AI-SEAT-LATENCY-002 phase 2.G: file-IPC INPUT arrivals
+            // (cpit drive emit_* + kore mouse/scroll during the migration window)
+            // delegate to compstr's owned dispatcher. write_response handles the
+            // nowait-UUID skip (QW2 receiver) for cpit's fire-and-forget tagging;
+            // kore CLI callers without the prefix receive the success ack.
+            cmd @ (IpcCommand::Click { .. }
+                 | IpcCommand::MouseDown { .. }
+                 | IpcCommand::MouseUp { .. }
+                 | IpcCommand::Move { .. }
+                 | IpcCommand::Scroll { .. }
+                 | IpcCommand::Key { .. }
+                 | IpcCommand::Type { .. }) => {
+                compstr::ipc::handle_input(self, cmd);
+                ipc::success(json!({"action": "input", "transport": "file-ipc"}))
             }
         }
     }

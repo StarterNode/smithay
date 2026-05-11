@@ -6,11 +6,13 @@
     allow(dead_code, unused_imports)
 )]
 
+pub mod compstr_ops;
 #[cfg(any(feature = "udev", feature = "xwayland"))]
 pub mod cursor;
 pub mod drawing;
 pub mod focus;
 pub mod input_handler;
+pub mod keyboard_helpers;
 pub mod render;
 pub mod shell;
 pub mod state;
