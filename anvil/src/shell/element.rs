@@ -105,23 +105,11 @@ impl WindowElement {
             Point::default()
         };
 
-        // Check for popup/client surface first — popups extend beyond the
-        // window and must take priority over SSD border zones.
-        let surface_under = self.0.surface_under(location - offset.to_f64(), window_type);
-        let client_hit = match self.0.underlying_surface() {
-            WindowSurface::Wayland(_) => {
-                surface_under.map(|(surface, loc)| (PointerFocusTarget::WlSurface(surface), loc + offset))
-            }
-            #[cfg(feature = "xwayland")]
-            WindowSurface::X11(s) => {
-                surface_under.map(|(_, loc)| (PointerFocusTarget::X11Surface(s.clone()), loc + offset))
-            }
-        };
-        if client_hit.is_some() {
-            return client_hit;
-        }
-
-        // No popup/client surface — check SSD zones
+        // SSD zones short-circuit BEFORE client surface_under because borders
+        // overlay the client visually (no client inset) — without this order,
+        // every left/right/bottom edge click is absorbed by the client and
+        // never reaches resize_request_ssd. Popups extending beyond the window
+        // edge remain reachable via the fall-through below.
         if state.is_ssd {
             if location.y < HEADER_BAR_HEIGHT as f64 {
                 return Some((PointerFocusTarget::SSD(SSD(self.clone())), Point::default()));
@@ -136,7 +124,16 @@ impl WindowElement {
             }
         }
 
-        None
+        let surface_under = self.0.surface_under(location - offset.to_f64(), window_type);
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(_) => {
+                surface_under.map(|(surface, loc)| (PointerFocusTarget::WlSurface(surface), loc + offset))
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(s) => {
+                surface_under.map(|(_, loc)| (PointerFocusTarget::X11Surface(s.clone()), loc + offset))
+            }
+        }
     }
 
     pub fn with_surfaces<F>(&self, processor: F)
