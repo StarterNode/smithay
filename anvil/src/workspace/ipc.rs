@@ -176,6 +176,15 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 compstr::ipc::handle_input(self, cmd);
                 ipc::success(json!({"action": "input", "transport": "file-ipc"}))
             }
+
+            // GUIDE-018-RETRY: window-state ops dispatch through compstr.
+            // handle_window_op validates wm_class against MANAGED_WM_CLASSES
+            // (hardcoded explicit allowlist) BEFORE calling apply_window_op;
+            // manji.aidesktop and any non-allowlisted class are refused with
+            // a Law-5 JSON error.
+            cmd @ (IpcCommand::Show { .. }
+                 | IpcCommand::Hide { .. }
+                 | IpcCommand::Toggle { .. }) => compstr::ipc::handle_window_op(self, cmd),
         }
     }
 
