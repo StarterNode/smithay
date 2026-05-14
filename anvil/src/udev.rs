@@ -28,10 +28,10 @@ use smithay::backend::renderer::ImportMem;
 use smithay::{
     backend::{
         allocator::{
-            dmabuf::Dmabuf,
+            dmabuf::{AsDmabuf, Dmabuf},
             format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
-            Fourcc, Modifier,
+            Allocator, Fourcc, Modifier,
         },
         drm::{
             compositor::{DrmCompositor, FrameFlags},
@@ -1014,6 +1014,7 @@ impl AnvilState<UdevData> {
             // their connector-named Workspace.
             let is_first_seen = device.surfaces.is_empty();
             let position: smithay::utils::Point<i32, smithay::utils::Logical> = (0, 0).into();
+            let mut intermediate_allocator = device.drm_output_manager.allocator().clone();
 
             // Drop the &mut device borrow before calling attach_real_head — the
             // closure re-acquires it via self.backend_data.backends.get_mut.
@@ -1115,6 +1116,10 @@ impl AnvilState<UdevData> {
                     device.surfaces.insert(crtc, surface);
                     Ok(())
                 },
+                move |size| intermediate_allocator
+                    .create_buffer(size.w as u32, size.h as u32, Fourcc::Argb8888, &[Modifier::Invalid])
+                    .map_err(|e| compstr::axis::AttachError::DrmInit(format!("intermediate alloc: {e}")))
+                    .and_then(|b| b.export().map_err(|e| compstr::axis::AttachError::DrmInit(format!("intermediate export: {e}")))),
             );
 
             match attach_result {
@@ -1551,6 +1556,7 @@ impl AnvilState<UdevData> {
             cursor_status,
             self.show_window_preview,
             self.snap_preview.as_ref(),
+            &mut self.axis,
         );
 
         // Process pending mirror frames for AI workspaces (ext-image-copy-capture clients)
@@ -1710,6 +1716,7 @@ fn render_surface<'a>(
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
     snap_preview: Option<&crate::shell::snap::SnapPreview>,
+    axis: &mut compstr::axis::Axis,
 ) -> Result<(bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -1800,8 +1807,9 @@ fn render_surface<'a>(
         custom_elements.push(CustomRenderElements::Fps(element.clone()));
     }
 
-    let (elements, clear_color) =
+    let (mut elements, clear_color) =
         output_elements(output, space, custom_elements, renderer, show_window_preview);
+    axis.prepend_mirror_if_target(output, renderer, &mut elements);
 
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()
@@ -1813,9 +1821,10 @@ fn render_surface<'a>(
         .render_frame(renderer, &elements, clear_color, frame_mode)
         .map(|render_frame_result| {
             #[cfg(feature = "renderer_sync")]
-            if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
+            if let PrimaryPlaneElement::Swapchain(element) = &render_frame_result.primary_element {
                 element.sync.wait();
             }
+            axis.publish_mirror_if_source(output, &render_frame_result, renderer);
             (!render_frame_result.is_empty, render_frame_result.states)
         })
         .map_err(|err| match err {
