@@ -114,6 +114,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             }
             compstr::foreign_toplevels::sync_on_commit::<Self>(
                 &mut state.foreign_toplevel_list,
+                &mut state.wlr_foreign_toplevel_manager,
                 surface,
             );
         });

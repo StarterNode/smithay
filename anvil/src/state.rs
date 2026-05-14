@@ -179,6 +179,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub kde_decoration_state: KdeDecorationState,
     pub xdg_shell_state: XdgShellState,
     pub foreign_toplevel_list: ForeignToplevelListState,
+    pub wlr_foreign_toplevel_manager: compstr::wlr_foreign_toplevel_management::WlrForeignToplevelManagerState,
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub xdg_foreign_state: XdgForeignState,
@@ -784,6 +785,45 @@ impl<BackendData: Backend + 'static> ForeignToplevelListHandler for AnvilState<B
 }
 delegate_foreign_toplevel_list!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
+// CPIT-015 Phase 3: wlr-foreign-toplevel-management-unstable-v1 handler.
+// Thin bridge — protocol behavior lives in compstr's Dispatch impl;
+// anvil supplies only state access + a generic-glue handle→space lookup.
+impl<BackendData: Backend + 'static>
+    compstr::wlr_foreign_toplevel_management::WlrForeignToplevelManagerHandler
+    for AnvilState<BackendData>
+{
+    type Window = crate::shell::WindowElement;
+
+    fn wlr_foreign_toplevel_manager_state(
+        &mut self,
+    ) -> &mut compstr::wlr_foreign_toplevel_management::WlrForeignToplevelManagerState {
+        &mut self.wlr_foreign_toplevel_manager
+    }
+
+    fn resolve_handle(
+        &mut self,
+        handle: &compstr::wlr_foreign_toplevel_management::ForeignToplevelHandle,
+    ) -> Option<(Self::Window, ToplevelSurface, &mut Space<Self::Window>)> {
+        let wl_surface = handle.wl_surface();
+        let window = self.window_for_surface(&wl_surface)?;
+        let toplevel = window.0.toplevel().cloned()?;
+        // Two-step to avoid conditional mutable borrow: check existence
+        // immutably (closure captures &workspaces), then take &mut on
+        // exactly one branch.
+        let ws_id = self
+            .workspaces
+            .workspace_id_for_surface(&wl_surface)
+            .filter(|id| self.workspaces.get_space(*id).is_some());
+        let space = if let Some(id) = ws_id {
+            self.workspaces.get_space_mut(id).unwrap()
+        } else {
+            self.workspaces.space_mut()
+        };
+        Some((window, toplevel, space))
+    }
+}
+compstr::delegate_wlr_foreign_toplevel_management!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
 smithay::delegate_single_pixel_buffer!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 smithay::delegate_fifo!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -892,6 +932,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         };
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
+        let wlr_foreign_toplevel_manager =
+            compstr::wlr_foreign_toplevel_management::WlrForeignToplevelManagerState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
@@ -980,6 +1022,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             kde_decoration_state,
             xdg_shell_state,
             foreign_toplevel_list,
+            wlr_foreign_toplevel_manager,
             presentation_state,
             fractional_scale_manager_state,
             xdg_foreign_state,
