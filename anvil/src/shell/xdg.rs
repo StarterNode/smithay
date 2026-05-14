@@ -21,11 +21,13 @@ use smithay::{
         seat::WaylandFocus,
         shell::xdg::{
             Configure, PopupSurface, PositionerState, ToplevelCachedState, ToplevelSurface, XdgShellHandler,
-            XdgShellState,
+            XdgShellState, XdgToplevelSurfaceData,
         },
     },
 };
 use tracing::{trace, warn};
+
+use compstr::ipc::HIDE_OFFSCREEN_X;
 
 use crate::{
     focus::KeyboardFocusTarget,
@@ -508,6 +510,48 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         } else {
             // Will be sent during initial configure
         }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        // CPIT-015 Phase 1. Defensive refusal — manji.aidesktop is the AI
+        // desktop parent kiosk (GUIde the_six_lines.line_1) and must never
+        // be minimized. Sanity gate g1: filter enforced here + cpit consumer
+        // + window-chrome SSD render path (defense in depth).
+        let app_id = with_states(surface.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok())
+                .and_then(|guard| guard.app_id.clone())
+                .unwrap_or_default()
+        });
+        if app_id == "manji.aidesktop" {
+            warn!("minimize_request refused for manji.aidesktop (load-bearing invariant)");
+            return;
+        }
+
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            warn!("minimize_request: no window for surface");
+            return;
+        };
+        let ws_id = self
+            .workspaces
+            .workspace_id_for_surface(surface.wl_surface());
+        let space = match ws_id.and_then(|id| self.workspaces.get_space_mut(id)) {
+            Some(space) => space,
+            None => self.workspaces.space_mut(),
+        };
+
+        // Off-screen keeps the surface mapped (same mechanism as compstr_ops
+        // Hide at compstr_ops.rs:195); activate=false drops focus.
+        space.map_element(window, (HIDE_OFFSCREEN_X, 0_i32), false);
+
+        // Suspended drives chromium ozone visibilitychange / document.hidden,
+        // which GUIDE-018 page-reload-on-show depends on (xdg-shell v6).
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Suspended);
+        });
+        surface.send_configure();
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
