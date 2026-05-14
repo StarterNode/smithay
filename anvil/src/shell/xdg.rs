@@ -71,7 +71,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             let maximize_geo = space.outputs().next()
                 .and_then(|o| {
                     let geo = space.output_geometry(o)?;
-                    let zone = layer_map_for_output(o).non_exclusive_zone();
+                    let zone = compstr::placement::topbar_safe_zone(o);
                     Some(Rectangle::new(geo.loc + zone.loc, zone.size))
                 });
 
@@ -463,8 +463,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             return;
         };
         let geometry = {
-            let map = layer_map_for_output(output);
-            let zone = map.non_exclusive_zone();
+            let zone = compstr::placement::topbar_safe_zone(output);
             Rectangle::new(geo.loc + zone.loc, zone.size)
         };
 
