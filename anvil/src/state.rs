@@ -804,7 +804,7 @@ impl<BackendData: Backend + 'static>
         &mut self,
         handle: &compstr::wlr_foreign_toplevel_management::ForeignToplevelHandle,
     ) -> Option<(Self::Window, ToplevelSurface, &mut Space<Self::Window>)> {
-        let wl_surface = handle.wl_surface();
+        let wl_surface = handle.wl_surface()?;
         let window = self.window_for_surface(&wl_surface)?;
         let toplevel = window.0.toplevel().cloned()?;
         // Two-step to avoid conditional mutable borrow: check existence
