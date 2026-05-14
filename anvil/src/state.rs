@@ -17,8 +17,8 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_data_control, delegate_data_device, delegate_fixes,
-    delegate_fractional_scale, delegate_input_method_manager, delegate_kde_decoration,
-    delegate_keyboard_shortcuts_inhibit,
+    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_input_method_manager,
+    delegate_kde_decoration, delegate_keyboard_shortcuts_inhibit,
     delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
     delegate_presentation, delegate_primary_selection, delegate_relative_pointer,
     delegate_security_context, delegate_shm, delegate_tablet_manager, delegate_text_input_manager,
@@ -64,6 +64,7 @@ use smithay::{
         dmabuf::DmabufFeedback,
         fifo::{FifoBarrierCachedState, FifoManagerState},
         fixes::FixesState,
+        foreign_toplevel_list::{ForeignToplevelListHandler, ForeignToplevelListState},
         fractional_scale::{with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState},
         image_capture_source::{
             ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState,
@@ -177,6 +178,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub xdg_decoration_state: XdgDecorationState,
     pub kde_decoration_state: KdeDecorationState,
     pub xdg_shell_state: XdgShellState,
+    pub foreign_toplevel_list: ForeignToplevelListState,
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub xdg_foreign_state: XdgForeignState,
@@ -775,6 +777,13 @@ impl<BackendData: Backend> XdgForeignHandler for AnvilState<BackendData> {
 }
 smithay::delegate_xdg_foreign!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
+impl<BackendData: Backend + 'static> ForeignToplevelListHandler for AnvilState<BackendData> {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list
+    }
+}
+delegate_foreign_toplevel_list!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
 smithay::delegate_single_pixel_buffer!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 smithay::delegate_fifo!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -882,6 +891,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             KdeDecorationState::new::<Self>(&dh, KdeDefaultMode::Server)
         };
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
@@ -969,6 +979,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             xdg_decoration_state,
             kde_decoration_state,
             xdg_shell_state,
+            foreign_toplevel_list,
             presentation_state,
             fractional_scale_manager_state,
             xdg_foreign_state,

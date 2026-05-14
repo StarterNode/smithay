@@ -112,6 +112,10 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             if let Some(space) = state.workspaces.space_for_surface_mut(surface) {
                 handle_toplevel_commit(space, surface);
             }
+            compstr::foreign_toplevels::sync_on_commit::<Self>(
+                &mut state.foreign_toplevel_list,
+                surface,
+            );
         });
     }
 
