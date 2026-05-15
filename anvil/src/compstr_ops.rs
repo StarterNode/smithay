@@ -20,14 +20,10 @@
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER as SCOUNTER};
-use smithay::wayland::compositor::with_states;
-use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-use tracing::{info, warn};
+use tracing::warn;
 
-use compstr::ipc::{CompositorOps, WindowOp, WindowOpOutcome, HIDE_OFFSCREEN_X};
-use compstr::workspace::{WlSurfaceAccessor, WorkspaceId};
-
-use crate::shell::WindowElement;
+use compstr::ipc::CompositorOps;
+use compstr::workspace::WorkspaceId;
 
 use crate::focus::PointerFocusTarget;
 use crate::state::{AnvilState, Backend};
@@ -76,10 +72,6 @@ impl<BackendData: Backend + 'static> CompositorOps for AnvilState<BackendData> {
 
     fn keyboard_type(&mut self, workspace: WorkspaceId, text: &str) {
         self.do_keyboard_type(workspace, text);
-    }
-
-    fn apply_window_op(&mut self, app_id: &str, op: WindowOp) -> WindowOpOutcome {
-        self.do_apply_window_op(app_id, op)
     }
 }
 
@@ -149,81 +141,6 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 }
             }
         }
-    }
-
-    /// GUIDE-018-RETRY: find the [`WindowElement`] whose XDG `app_id` matches,
-    /// then map it on-screen or off-screen depending on `op`.
-    ///
-    /// Cross-workspace search: face kiosks may land on any workspace's Space
-    /// depending on cpit's spawn target. The first exact `app_id` match wins
-    /// (collisions across workspaces are not expected — wm_class strings are
-    /// unique per kiosk binary).
-    ///
-    /// Phase 2 mechanism: off-screen positioning via [`Space::map_element`].
-    /// Hide => location.x == HIDE_OFFSCREEN_X (window stays mapped, off-screen).
-    /// Show => location.x == 0, activate == true (focus).
-    /// Toggle => query current geometry; flip based on x sign.
-    ///
-    /// Callers MUST pre-validate `app_id` via [`compstr::ipc::is_managed_wm_class`]
-    /// — this helper trusts the input. compstr's [`handle_window_op`] does the
-    /// validation centrally.
-    fn do_apply_window_op(&mut self, app_id: &str, op: WindowOp) -> WindowOpOutcome {
-        let Some(window) = self.find_window_by_app_id(app_id) else {
-            return WindowOpOutcome::NotFound;
-        };
-        let Some(space) = self
-            .workspaces
-            .iter_spaces_mut()
-            .find(|s| s.elements().any(|e| e == &window))
-        else {
-            return WindowOpOutcome::NotFound;
-        };
-
-        let currently_visible = space
-            .element_geometry(&window)
-            .map(|r| r.loc.x >= 0)
-            .unwrap_or(false);
-        let target_visible = match op {
-            WindowOp::Show => true,
-            WindowOp::Hide => false,
-            WindowOp::Toggle => !currently_visible,
-        };
-
-        if target_visible {
-            space.map_element(window.clone(), (0_i32, 0_i32), true);
-        } else {
-            space.map_element(window.clone(), (HIDE_OFFSCREEN_X, 0_i32), false);
-        }
-        info!(
-            "window-op: app_id='{}' currently_visible={} -> now_visible={}",
-            app_id, currently_visible, target_visible
-        );
-        WindowOpOutcome::Applied {
-            now_visible: target_visible,
-        }
-    }
-
-    /// Cross-workspace lookup: first [`WindowElement`] whose XDG toplevel
-    /// `app_id` equals `app_id`. Reads via [`with_states`] +
-    /// [`XdgToplevelSurfaceData`] under the surface's compositor state lock.
-    fn find_window_by_app_id(&self, app_id: &str) -> Option<WindowElement> {
-        self.workspaces
-            .iter_spaces()
-            .flat_map(|space| space.elements())
-            .find(|elem| {
-                let Some(surface) = elem.wl_surface() else {
-                    return false;
-                };
-                with_states(&surface, |states| {
-                    states
-                        .data_map
-                        .get::<XdgToplevelSurfaceData>()
-                        .and_then(|d| d.lock().ok().and_then(|g| g.app_id.clone()))
-                        .as_deref()
-                        == Some(app_id)
-                })
-            })
-            .cloned()
     }
 
     /// Emit a pointer axis (scroll) event. No frame() — caller commits via
