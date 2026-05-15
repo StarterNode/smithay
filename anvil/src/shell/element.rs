@@ -50,6 +50,7 @@ const BTN_LEFT: u32 = 0x110;
 enum SsdAction {
     Close,
     Maximize,
+    Minimize,
     Move,
     Resize(super::grabs::ResizeEdge),
 }
@@ -312,6 +313,7 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
                 match zone {
                     ssd_input::DecorationHitZone::CloseButton => SsdAction::Close,
                     ssd_input::DecorationHitZone::MaximizeButton => SsdAction::Maximize,
+                    ssd_input::DecorationHitZone::MinimizeButton => SsdAction::Minimize,
                     _ => SsdAction::Move,
                 }
             }
@@ -335,6 +337,18 @@ impl<BackendData: Backend> PointerTarget<AnvilState<BackendData>> for SSD {
                         .insert_idle(move |data| data.maximize_request_x11(&surface));
                 }
             },
+            SsdAction::Minimize => {
+                // CPIT-017 Phase 5 — pointer click on _ button routes here.
+                // Wayland-only; X11 has no xdg-shell minimize equivalent.
+                eprintln!("[anvil/ssd] _ button clicked → minimize_request (pointer)");
+                match self.0 .0.underlying_surface() {
+                    WindowSurface::Wayland(w) => data.minimize_request(w.clone()),
+                    #[cfg(feature = "xwayland")]
+                    WindowSurface::X11(_) => {
+                        eprintln!("[anvil/ssd] minimize on X11 not implemented; skipping");
+                    }
+                }
+            }
             SsdAction::Move => match self.0 .0.underlying_surface() {
                 WindowSurface::Wayland(w) => {
                     let seat = seat.clone();
@@ -453,7 +467,10 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
             }
             state.header_bar.pointer_enter(event.location);
             // Touch down only starts move — close/maximize happen on touch_up
-            if !state.header_bar.is_over_close() && !state.header_bar.is_over_maximize() {
+            if !state.header_bar.is_over_close()
+                && !state.header_bar.is_over_maximize()
+                && !state.header_bar.is_over_minimize()
+            {
                 if state.header_bar.pointer_loc.is_some() {
                     Some(SsdAction::Move)
                 } else {
@@ -500,6 +517,8 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
                 Some(SsdAction::Close)
             } else if state.header_bar.is_over_maximize() {
                 Some(SsdAction::Maximize)
+            } else if state.header_bar.is_over_minimize() {
+                Some(SsdAction::Minimize)
             } else {
                 None
             }
@@ -523,6 +542,12 @@ impl<BackendData: Backend> TouchTarget<AnvilState<BackendData>> for SSD {
                             .insert_idle(move |data| data.maximize_request_x11(&surface));
                     }
                 },
+                SsdAction::Minimize => {
+                    eprintln!("[anvil/ssd] _ button touch_up → minimize_request");
+                    if let WindowSurface::Wayland(w) = self.0 .0.underlying_surface() {
+                        data.minimize_request(w.clone());
+                    }
+                }
                 SsdAction::Move | SsdAction::Resize(_) => {} // Move/resize handled in touch_down, not up
             }
         }
