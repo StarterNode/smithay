@@ -35,6 +35,7 @@ pub struct HeaderBar {
     pub is_focused: bool,
     pub close_button_hover: bool,
     pub maximize_button_hover: bool,
+    pub minimize_button_hover: bool,
     // Title bar rendered as a single buffer via tiny-skia
     pub title_bar_buffer: Option<MemoryRenderBuffer>,
     // Borders (still SolidColorBuffer)
@@ -86,6 +87,7 @@ impl HeaderConfig {
                 button_width: theme.buttons.width as u32,
                 close_hover_bg: theme.buttons.close_hover_bg,
                 maximize_hover_bg: theme.buttons.maximize_hover_bg,
+                minimize_hover_bg: theme.buttons.minimize_hover_bg,
                 gradient,
                 icon_color: theme.button_icon.color,
                 icon_color_unfocused: theme.button_icon.color_unfocused,
@@ -123,6 +125,7 @@ impl HeaderBar {
             is_focused: true,
             close_button_hover: false,
             maximize_button_hover: false,
+            minimize_button_hover: false,
             title_bar_buffer: None,
             border_left: SolidColorBuffer::default(),
             border_right: SolidColorBuffer::default(),
@@ -176,6 +179,17 @@ impl HeaderBar {
             .unwrap_or(false)
     }
 
+    /// Check if pointer is over minimize button (third from right).
+    /// CPIT-017 Phase 5. Layout in theme/window.json buttons.order is
+    /// [minimize, maximize, close] left-to-right.
+    pub fn is_over_minimize(&self) -> bool {
+        let bw = self.button_width();
+        self.pointer_loc
+            .as_ref()
+            .map(|l| l.x >= (self.width - bw * 3) as f64 && l.x < (self.width - bw * 2) as f64)
+            .unwrap_or(false)
+    }
+
     pub fn clicked<BackendData: Backend>(
         &mut self,
         seat: &Seat<AnvilState<BackendData>>,
@@ -200,6 +214,22 @@ impl HeaderBar {
                     state
                         .handle
                         .insert_idle(move |data| data.maximize_request_x11(&surface));
+                }
+            };
+        } else if self.is_over_minimize() {
+            // CPIT-017 Phase 5 — _ button routes to minimize_request.
+            // Wayland path delegates to XdgShellHandler::minimize_request
+            // which already calls compstr::minimize::handle_set_minimized
+            // (per anvil/src/shell/xdg.rs:518). X11 path: no minimize
+            // protocol equivalent, skip.
+            match window.0.underlying_surface() {
+                WindowSurface::Wayland(w) => {
+                    eprintln!("[anvil/ssd] _ button clicked → minimize_request (Wayland)");
+                    state.minimize_request(w.clone());
+                }
+                #[cfg(feature = "xwayland")]
+                WindowSurface::X11(_) => {
+                    eprintln!("[anvil/ssd] _ button clicked on X11 window — minimize not implemented for X11 path");
                 }
             };
         } else if self.pointer_loc.is_some() {
@@ -230,7 +260,7 @@ impl HeaderBar {
         window: &WindowElement,
         serial: Serial,
     ) {
-        if !self.is_over_close() && !self.is_over_maximize() {
+        if !self.is_over_close() && !self.is_over_maximize() && !self.is_over_minimize() {
             if self.pointer_loc.is_some() {
                 match window.0.underlying_surface() {
                     WindowSurface::Wayland(w) => {
@@ -278,6 +308,11 @@ impl HeaderBar {
                         .insert_idle(move |data| data.maximize_request_x11(&surface));
                 }
             };
+        } else if self.is_over_minimize() {
+            if let WindowSurface::Wayland(w) = window.0.underlying_surface() {
+                eprintln!("[anvil/ssd] _ button touch_up → minimize_request (Wayland)");
+                state.minimize_request(w.clone());
+            }
         }
     }
 
@@ -296,6 +331,8 @@ impl HeaderBar {
             HoverState::Close
         } else if self.is_over_maximize() {
             HoverState::Maximize
+        } else if self.is_over_minimize() {
+            HoverState::Minimize
         } else {
             HoverState::None
         };
@@ -320,6 +357,7 @@ impl HeaderBar {
         // Update hover tracking
         self.close_button_hover = hover == HoverState::Close;
         self.maximize_button_hover = hover == HoverState::Maximize;
+        self.minimize_button_hover = hover == HoverState::Minimize;
 
         // Borders
         let border_color = self.border_color();
@@ -392,6 +430,7 @@ impl WindowElement {
                     is_focused: true,
                     close_button_hover: false,
                     maximize_button_hover: false,
+                    minimize_button_hover: false,
                     title_bar_buffer: None,
                     border_left: SolidColorBuffer::default(),
                     border_right: SolidColorBuffer::default(),

@@ -7,6 +7,7 @@ pub enum DecorationHitZone {
     TitleBar,
     CloseButton,
     MaximizeButton,
+    MinimizeButton,
     BorderTop,
     BorderBottom,
     BorderLeft,
@@ -60,6 +61,14 @@ pub fn hit_test(
         // Maximize button (second from right)
         if x >= window_width - button_width * 2.0 {
             return DecorationHitZone::MaximizeButton;
+        }
+        // Minimize button (third from right). CPIT-017 Phase 5.
+        // Layout left-to-right in theme/window.json buttons.order is
+        // [minimize, maximize, close]. Anvil currently hardcodes the
+        // right-aligned positions; making position config-driven from
+        // buttons.order is a follow-up scope.
+        if x >= window_width - button_width * 3.0 {
+            return DecorationHitZone::MinimizeButton;
         }
         // Remaining title bar area
         return DecorationHitZone::TitleBar;

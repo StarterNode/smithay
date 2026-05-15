@@ -15,6 +15,7 @@ pub enum HoverState {
     None,
     Close,
     Maximize,
+    Minimize,
 }
 
 /// Gradient stripe configuration, pre-parsed from theme.
@@ -33,6 +34,7 @@ pub struct TitleBarStyle {
     pub button_width: u32,
     pub close_hover_bg: [f32; 4],
     pub maximize_hover_bg: [f32; 4],
+    pub minimize_hover_bg: [f32; 4],
     pub gradient: Option<GradientConfig>,
     pub icon_color: [f32; 4],
     pub icon_color_unfocused: [f32; 4],
@@ -85,6 +87,16 @@ pub fn render_title_bar(
                 style.maximize_hover_bg,
             );
         }
+        HoverState::Minimize => {
+            // CPIT-017 Phase 5: minimize button is third from right.
+            fill_button_bg(
+                &mut pixmap,
+                width as f32 - bw * 3.0,
+                bw,
+                bh,
+                style.minimize_hover_bg,
+            );
+        }
         HoverState::None => {}
     }
 
@@ -118,6 +130,13 @@ pub fn render_title_bar(
     let max_cx = width as f32 - bw * 1.5;
     let max_cy = bh / 2.0;
     if let Some(path) = icons::maximize_icon_path(max_cx, max_cy, half_icon) {
+        pixmap.stroke_path(&path, &paint, &stroke, TsTransform::identity(), None);
+    }
+
+    // Minimize icon (third from right) — CPIT-017 Phase 5.
+    let min_cx = width as f32 - bw * 2.5;
+    let min_cy = bh / 2.0;
+    if let Some(path) = icons::minimize_icon_path(min_cx, min_cy, half_icon) {
         pixmap.stroke_path(&path, &paint, &stroke, TsTransform::identity(), None);
     }
 

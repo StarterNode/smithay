@@ -26,3 +26,13 @@ pub fn maximize_icon_path(cx: f32, cy: f32, half_size: f32) -> Option<Path> {
     pb.close();
     pb.finish()
 }
+
+/// Minimize button icon: horizontal line centered at (cx, cy) spanning
+/// 2 * half_size wide. CPIT-017 Phase 5. Visual is the standard "underscore-
+/// at-baseline" glyph for minimize that GTK/macOS use.
+pub fn minimize_icon_path(cx: f32, cy: f32, half_size: f32) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - half_size, cy);
+    pb.line_to(cx + half_size, cy);
+    pb.finish()
+}
