@@ -1,4 +1,4 @@
-use std::{io::Read, time::Duration};
+use std::{collections::HashMap, io::Read, time::Duration};
 
 use tracing::warn;
 use xcursor::{
@@ -8,8 +8,24 @@ use xcursor::{
 
 static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../resources/cursor.rgba");
 
+/// WINDOW-CHROME-002 Phase 2.7: shapes preloaded at startup so cursor_status
+/// = Named(<shape>) actually renders the requested shape (not always "default").
+/// "default" is mandatory — it's the fallback when a non-preloaded shape is
+/// requested AND the per-shape resize cursors used by anvil's SSD hover handlers.
+const PRELOAD_SHAPES: &[&str] = &[
+    "default",
+    "w-resize",
+    "e-resize",
+    "n-resize",
+    "s-resize",
+    "nw-resize",
+    "ne-resize",
+    "sw-resize",
+    "se-resize",
+];
+
 pub struct Cursor {
-    icons: Vec<Image>,
+    icons: HashMap<String, Vec<Image>>,
     size: u32,
 }
 
@@ -24,27 +40,50 @@ impl Cursor {
             .unwrap_or(24);
 
         let theme = CursorTheme::load(&name);
-        let icons = load_icon(&theme)
-            .map_err(|err| warn!("Unable to load xcursor: {}, using fallback cursor", err))
-            .unwrap_or_else(|_| {
-                vec![Image {
-                    size: 32,
-                    width: 64,
-                    height: 64,
-                    xhot: 1,
-                    yhot: 1,
-                    delay: 1,
-                    pixels_rgba: Vec::from(FALLBACK_CURSOR_DATA),
-                    pixels_argb: vec![], //unused
-                }]
-            });
+        let mut icons: HashMap<String, Vec<Image>> = HashMap::new();
+        for shape in PRELOAD_SHAPES {
+            match load_icon(&theme, shape) {
+                Ok(images) => {
+                    icons.insert((*shape).to_string(), images);
+                }
+                Err(err) => {
+                    warn!("Unable to load xcursor shape '{}': {} — will fall back to default", shape, err);
+                }
+            }
+        }
+        // Guarantee "default" exists even if theme lookup failed across the board.
+        icons.entry("default".to_string()).or_insert_with(|| {
+            vec![Image {
+                size: 32,
+                width: 64,
+                height: 64,
+                xhot: 1,
+                yhot: 1,
+                delay: 1,
+                pixels_rgba: Vec::from(FALLBACK_CURSOR_DATA),
+                pixels_argb: vec![], //unused
+            }]
+        });
 
         Cursor { icons, size }
     }
 
+    /// Returns the "default" cursor frame. Kept for backward compatibility with
+    /// call sites (XWayland init) that don't track a specific shape.
     pub fn get_image(&self, scale: u32, time: Duration) -> Image {
+        self.get_image_for("default", scale, time)
+    }
+
+    /// Returns the frame for the requested CSS-style shape name (e.g. "w-resize").
+    /// Falls back to "default" if the shape wasn't preloaded or isn't in the theme.
+    pub fn get_image_for(&self, shape: &str, scale: u32, time: Duration) -> Image {
         let size = self.size * scale;
-        frame(time.as_millis() as u32, size, &self.icons)
+        let images = self
+            .icons
+            .get(shape)
+            .or_else(|| self.icons.get("default"))
+            .expect("default cursor always present after Cursor::load");
+        frame(time.as_millis() as u32, size, images)
     }
 }
 
@@ -87,8 +126,8 @@ enum Error {
     Parse,
 }
 
-fn load_icon(theme: &CursorTheme) -> Result<Vec<Image>, Error> {
-    let icon_path = theme.load_icon("default").ok_or(Error::NoDefaultCursor)?;
+fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, Error> {
+    let icon_path = theme.load_icon(name).ok_or(Error::NoDefaultCursor)?;
     let mut cursor_file = std::fs::File::open(icon_path)?;
     let mut cursor_data = Vec::new();
     cursor_file.read_to_end(&mut cursor_data)?;

@@ -1493,10 +1493,17 @@ impl AnvilState<UdevData> {
         let start = Instant::now();
 
         // TODO get scale from the rendersurface when supporting HiDPI
+        // WINDOW-CHROME-002 Phase 2.7: pick the cursor shape from cursor_status
+        // so the per-edge resize cursors set by element.rs::SSD::enter/motion
+        // actually render. Pre-2.7 anvil always rendered the "default" shape.
+        let shape_name = match &self.cursor_status {
+            CursorImageStatus::Named(icon) => icon.name(),
+            _ => "default",
+        };
         let frame = self
             .backend_data
             .pointer_image
-            .get_image(1 /*scale*/, self.clock.now().into());
+            .get_image_for(shape_name, 1 /*scale*/, self.clock.now().into());
 
         let primary_gpu = self.backend_data.primary_gpu;
         let render_node = surface.render_node.unwrap_or(primary_gpu);

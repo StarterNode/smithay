@@ -19,11 +19,15 @@ pub enum DecorationHitZone {
     ClientArea,
 }
 
-/// Size of corner grab zones in logical pixels.
-const CORNER_SIZE: f64 = 12.0;
+/// Size of corner grab zones in logical pixels. WINDOW-CHROME-002 Phase 2.6
+/// widened from 12 → 24 (matches KWin/Mutter defaults; the visible border
+/// stays thin but the grab area is large enough to lock onto reliably).
+const CORNER_SIZE: f64 = 24.0;
 
-/// Width of edge grab zones in logical pixels (wider than visual border for usability).
-const EDGE_WIDTH: f64 = 6.0;
+/// Width of edge grab zones in logical pixels. WINDOW-CHROME-002 Phase 2.6
+/// widened from 6 → 12 — at 6 px the zone is functionally invisible without
+/// cursor feedback (and even with, hard to lock on). 12 matches KWin/Mutter.
+const EDGE_WIDTH: f64 = 12.0;
 
 /// Hit-test a point against SSD decoration regions.
 ///

@@ -464,6 +464,27 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
 
         self.last_window_size = (new_window_width, new_window_height).into();
 
+        // WINDOW-CHROME-002 Phase 2.5: for LEFT/TOP resize, shift window origin
+        // so the opposite edge stays anchored DURING drag. Right/bottom resize
+        // doesn't need this (origin already stays put when width/height grows
+        // from the right/bottom). Upstream only does a release-time snap, which
+        // uses a stale window.geometry() and computes a zero delta — left-edge
+        // drags appear to shrink from the right instead of from the left.
+        if self.edges.intersects(ResizeEdge::LEFT) || self.edges.intersects(ResizeEdge::TOP) {
+            let mut new_location = self.initial_window_location;
+            if self.edges.intersects(ResizeEdge::LEFT) {
+                new_location.x = self.initial_window_location.x
+                    + (self.initial_window_size.w - new_window_width);
+            }
+            if self.edges.intersects(ResizeEdge::TOP) {
+                new_location.y = self.initial_window_location.y
+                    + (self.initial_window_size.h - new_window_height);
+            }
+            data.workspaces
+                .space_mut()
+                .map_element(self.window.clone(), new_location, false);
+        }
+
         // For SSD windows, subtract header height so the client receives
         // the correct client-only size in configure events.
         let configure_size: Size<i32, Logical> = (
@@ -529,16 +550,22 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                     });
                     xdg.send_pending_configure();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
-                        let geometry = self.window.geometry();
                         let mut location = data.workspaces.space().element_location(&self.window).unwrap();
 
+                        // WINDOW-CHROME-002 Phase 2.5: use last_window_size (the
+                        // size we negotiated during motion) not window.geometry()
+                        // — the client may not have committed the new buffer yet
+                        // at release time, so geometry() returns the OLD size and
+                        // the snap collapses to zero. Phase 2.5 also already
+                        // updates location during motion, so this block is a
+                        // safety net for any edge case the motion path missed.
                         if self.edges.intersects(ResizeEdge::LEFT) {
                             location.x = self.initial_window_location.x
-                                + (self.initial_window_size.w - geometry.size.w);
+                                + (self.initial_window_size.w - self.last_window_size.w);
                         }
                         if self.edges.intersects(ResizeEdge::TOP) {
                             location.y = self.initial_window_location.y
-                                + (self.initial_window_size.h - geometry.size.h);
+                                + (self.initial_window_size.h - self.last_window_size.h);
                         }
 
                         data.workspaces.space_mut().map_element(self.window.clone(), location, true);
@@ -561,15 +588,15 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
                 WindowSurface::X11(x11) => {
                     let mut location = data.workspaces.space().element_location(&self.window).unwrap();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
-                        let geometry = self.window.geometry();
-
+                        // WINDOW-CHROME-002 Phase 2.5: use last_window_size — see
+                        // Wayland branch comment above for the rationale.
                         if self.edges.intersects(ResizeEdge::LEFT) {
                             location.x = self.initial_window_location.x
-                                + (self.initial_window_size.w - geometry.size.w);
+                                + (self.initial_window_size.w - self.last_window_size.w);
                         }
                         if self.edges.intersects(ResizeEdge::TOP) {
                             location.y = self.initial_window_location.y
-                                + (self.initial_window_size.h - geometry.size.h);
+                                + (self.initial_window_size.h - self.last_window_size.h);
                         }
 
                         data.workspaces.space_mut().map_element(self.window.clone(), location, true);
