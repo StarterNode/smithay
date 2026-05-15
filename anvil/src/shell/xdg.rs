@@ -568,6 +568,14 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             "[anvil/xdg] toplevel_destroyed: unmapped window from space (workspace={:?})",
             ws_id,
         );
+        // CPIT-017 Phase 4 Path A live-fire revealed Space::unmap_elem is not
+        // sufficient on its own: the wlr_handle's Arc<HandleInner> holds a
+        // strong WlSurface clone, the surface keeps the data_map cell alive,
+        // the cell keeps the handle alive — circular dependency, neither
+        // drops. Explicit Closed emission breaks the wait: clients release
+        // their proxy refs immediately, and natural teardown cleans the rest
+        // at the next dispatch tick.
+        compstr::foreign_toplevels::notify_wlr_closed(surface.wl_surface());
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {

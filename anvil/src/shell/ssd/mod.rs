@@ -1,4 +1,3 @@
-pub mod geometry;
 pub mod icons;
 pub mod input;
 pub mod render;
@@ -33,9 +32,6 @@ pub struct HeaderBar {
     pub pointer_loc: Option<Point<f64, Logical>>,
     pub width: u32,
     pub is_focused: bool,
-    pub close_button_hover: bool,
-    pub maximize_button_hover: bool,
-    pub minimize_button_hover: bool,
     // Title bar rendered as a single buffer via tiny-skia
     pub title_bar_buffer: Option<MemoryRenderBuffer>,
     // Borders (still SolidColorBuffer)
@@ -123,9 +119,6 @@ impl HeaderBar {
             pointer_loc: None,
             width: 0,
             is_focused: true,
-            close_button_hover: false,
-            maximize_button_hover: false,
-            minimize_button_hover: false,
             title_bar_buffer: None,
             border_left: SolidColorBuffer::default(),
             border_right: SolidColorBuffer::default(),
@@ -190,132 +183,6 @@ impl HeaderBar {
             .unwrap_or(false)
     }
 
-    pub fn clicked<BackendData: Backend>(
-        &mut self,
-        seat: &Seat<AnvilState<BackendData>>,
-        state: &mut AnvilState<BackendData>,
-        window: &WindowElement,
-        serial: Serial,
-    ) {
-        if self.is_over_close() {
-            match window.0.underlying_surface() {
-                WindowSurface::Wayland(w) => w.send_close(),
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(w) => {
-                    let _ = w.close();
-                }
-            };
-        } else if self.is_over_maximize() {
-            match window.0.underlying_surface() {
-                WindowSurface::Wayland(w) => state.maximize_request(w.clone()),
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(w) => {
-                    let surface = w.clone();
-                    state
-                        .handle
-                        .insert_idle(move |data| data.maximize_request_x11(&surface));
-                }
-            };
-        } else if self.is_over_minimize() {
-            // CPIT-017 Phase 5 — _ button routes to minimize_request.
-            // Wayland path delegates to XdgShellHandler::minimize_request
-            // which already calls compstr::minimize::handle_set_minimized
-            // (per anvil/src/shell/xdg.rs:518). X11 path: no minimize
-            // protocol equivalent, skip.
-            match window.0.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    eprintln!("[anvil/ssd] _ button clicked → minimize_request (Wayland)");
-                    state.minimize_request(w.clone());
-                }
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(_) => {
-                    eprintln!("[anvil/ssd] _ button clicked on X11 window — minimize not implemented for X11 path");
-                }
-            };
-        } else if self.pointer_loc.is_some() {
-            // Title bar drag → move window
-            match window.0.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    let seat = seat.clone();
-                    let toplevel = w.clone();
-                    state
-                        .handle
-                        .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
-                }
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(w) => {
-                    let window = w.clone();
-                    state
-                        .handle
-                        .insert_idle(move |data| data.move_request_x11(&window));
-                }
-            };
-        }
-    }
-
-    pub fn touch_down<BackendData: Backend>(
-        &mut self,
-        seat: &Seat<AnvilState<BackendData>>,
-        state: &mut AnvilState<BackendData>,
-        window: &WindowElement,
-        serial: Serial,
-    ) {
-        if !self.is_over_close() && !self.is_over_maximize() && !self.is_over_minimize() {
-            if self.pointer_loc.is_some() {
-                match window.0.underlying_surface() {
-                    WindowSurface::Wayland(w) => {
-                        let seat = seat.clone();
-                        let toplevel = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.move_request_xdg(&toplevel, &seat, serial));
-                    }
-                    #[cfg(feature = "xwayland")]
-                    WindowSurface::X11(w) => {
-                        let window = w.clone();
-                        state
-                            .handle
-                            .insert_idle(move |data| data.move_request_x11(&window));
-                    }
-                };
-            }
-        }
-    }
-
-    pub fn touch_up<BackendData: Backend>(
-        &mut self,
-        _seat: &Seat<AnvilState<BackendData>>,
-        state: &mut AnvilState<BackendData>,
-        window: &WindowElement,
-        _serial: Serial,
-    ) {
-        if self.is_over_close() {
-            match window.0.underlying_surface() {
-                WindowSurface::Wayland(w) => w.send_close(),
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(w) => {
-                    let _ = w.close();
-                }
-            };
-        } else if self.is_over_maximize() {
-            match window.0.underlying_surface() {
-                WindowSurface::Wayland(w) => state.maximize_request(w.clone()),
-                #[cfg(feature = "xwayland")]
-                WindowSurface::X11(w) => {
-                    let surface = w.clone();
-                    state
-                        .handle
-                        .insert_idle(move |data| data.maximize_request_x11(&surface));
-                }
-            };
-        } else if self.is_over_minimize() {
-            if let WindowSurface::Wayland(w) = window.0.underlying_surface() {
-                eprintln!("[anvil/ssd] _ button touch_up → minimize_request (Wayland)");
-                state.minimize_request(w.clone());
-            }
-        }
-    }
-
     pub fn redraw(&mut self, width: u32, client_height: i32) {
         if width == 0 {
             self.width = 0;
@@ -353,11 +220,6 @@ impl HeaderBar {
             self.rendered_focused = self.is_focused;
             self.rendered_hover = hover;
         }
-
-        // Update hover tracking
-        self.close_button_hover = hover == HoverState::Close;
-        self.maximize_button_hover = hover == HoverState::Maximize;
-        self.minimize_button_hover = hover == HoverState::Minimize;
 
         // Borders
         let border_color = self.border_color();
@@ -428,9 +290,6 @@ impl WindowElement {
                     pointer_loc: None,
                     width: 0,
                     is_focused: true,
-                    close_button_hover: false,
-                    maximize_button_hover: false,
-                    minimize_button_hover: false,
                     title_bar_buffer: None,
                     border_left: SolidColorBuffer::default(),
                     border_right: SolidColorBuffer::default(),
