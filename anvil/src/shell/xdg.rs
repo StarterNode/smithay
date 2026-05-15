@@ -533,14 +533,40 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        // CPIT-017 Phase 4 instrumentation — anvil-side destroy hook trace.
-        // Pairs with compstr SurfaceForeignToplevelData::drop and cpit's
-        // on_wlr_handle_closed eprintlns. Three log points localize which
-        // link in the close chain fails. Remove after the live observation
-        // root-causes the X-removes-icon bug.
+        // CPIT-017 Phase 4 Path A — when the xdg_toplevel role is destroyed,
+        // unmap the corresponding Window from its Space. Anvil's default impl
+        // (smithay's no-op) leaves the Window in Space holding a WlSurface
+        // clone; the surface refcount never reaches 0 so smithay's destruction
+        // hook never fires, the per-surface data_map never drops, and
+        // compstr's SurfaceForeignToplevelData::drop never runs — so the wlr
+        // Closed event never reaches sidebar clients (cpit) and stale icons
+        // pile up. The fix is one explicit unmap. Confirmed live 2026-05-15:
+        // pre-Path-A the destroy hook fired but cell + Closed never did.
+        //
+        // Instrumentation eprintlns stay in this commit; removed in the
+        // follow-up commit once the live-fire log proves the full chain
+        // fires (anvil destroy → compstr drop → cpit Closed → icon gone).
         eprintln!(
             "[anvil/xdg] toplevel_destroyed fired wl_surface={:?}",
             surface.wl_surface().id(),
+        );
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            eprintln!(
+                "[anvil/xdg] toplevel_destroyed: no window for surface — already unmapped"
+            );
+            return;
+        };
+        let ws_id = self
+            .workspaces
+            .workspace_id_for_surface(surface.wl_surface());
+        let space = match ws_id.and_then(|id| self.workspaces.get_space_mut(id)) {
+            Some(space) => space,
+            None => self.workspaces.space_mut(),
+        };
+        space.unmap_elem(&window);
+        eprintln!(
+            "[anvil/xdg] toplevel_destroyed: unmapped window from space (workspace={:?})",
+            ws_id,
         );
     }
 
