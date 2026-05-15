@@ -532,6 +532,18 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         compstr::minimize::handle_set_minimized(space, window, &surface);
     }
 
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // CPIT-017 Phase 4 instrumentation — anvil-side destroy hook trace.
+        // Pairs with compstr SurfaceForeignToplevelData::drop and cpit's
+        // on_wlr_handle_closed eprintlns. Three log points localize which
+        // link in the close chain fails. Remove after the live observation
+        // root-causes the X-removes-icon bug.
+        eprintln!(
+            "[anvil/xdg] toplevel_destroyed fired wl_surface={:?}",
+            surface.wl_surface().id(),
+        );
+    }
+
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
         let seat: Seat<AnvilState<BackendData>> = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface);
