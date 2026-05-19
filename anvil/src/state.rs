@@ -7,6 +7,7 @@ use std::{
 };
 
 use compstr::ipc::IpcHandler;
+use compstr::wlr_foreign_toplevel_management::WlrForeignToplevelManagerHandler;
 use tracing::{info, warn};
 
 use smithay::{
@@ -589,14 +590,16 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
         surface: WlSurface,
     ) {
         if token_data.timestamp.elapsed().as_secs() < 10 {
-            // Just grant the wish
+            // Canonical activation pathway lives in compstr — anvil delegates
+            // via the WlrForeignToplevelManagerHandler trait default impl.
+            // See COMPSTR-WINDOW-RAISE-DIVERGENCE-001.
             let w = self
                 .workspaces.space()
                 .elements()
                 .find(|window: &&WindowElement| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
                 .cloned();
             if let Some(window) = w {
-                self.workspaces.space_mut().raise_element(&window, true);
+                self.activate_window_via_default_keyboard(&window);
             }
         }
     }
@@ -820,6 +823,22 @@ impl<BackendData: Backend + 'static>
             self.workspaces.space_mut()
         };
         Some((window, toplevel, space))
+    }
+
+    fn raise_window_through_stacking(&mut self, window: &Self::Window) {
+        self.stacking.raise_window(window);
+        self.stacking.reapply(self.workspaces.space_mut());
+    }
+
+    fn default_keyboard_handle(&self) -> Option<smithay::input::keyboard::KeyboardHandle<Self>> {
+        self.human_seat.get_keyboard()
+    }
+
+    fn raise_x11_surface_if_xwayland(&mut self, _window: &Self::Window) {
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = _window.0.x11_surface() {
+            let _ = self.xwm.as_mut().unwrap().raise_window(surface);
+        }
     }
 }
 compstr::delegate_wlr_foreign_toplevel_management!(@<BackendData: Backend + 'static> AnvilState<BackendData>);

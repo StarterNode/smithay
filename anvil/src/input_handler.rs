@@ -329,12 +329,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
 
             if let Some((window, _)) = self.workspaces.space().element_under(location).map(|(w, p)| (w.clone(), p)) {
-                self.stacking.raise_window(&window);
-                self.stacking.reapply(self.workspaces.space_mut());
-                #[cfg(feature = "xwayland")]
-                if let Some(surface) = window.0.x11_surface() {
-                    self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
-                }
+                // COMPSTR-WINDOW-RAISE-DIVERGENCE-001 single_activation_helper:
+                // route raise + X11 raise through the same WlrForeignToplevelManagerHandler
+                // accessors the wlr Activate + xdg_activation paths use. Three sites
+                // converge on raise_window_through_stacking + raise_x11_surface_if_xwayland.
+                // set_focus stays explicit here to preserve the incoming-serial semantics
+                // pointer-event correlation requires.
+                use compstr::wlr_foreign_toplevel_management::WlrForeignToplevelManagerHandler;
+                self.raise_window_through_stacking(&window);
+                self.raise_x11_surface_if_xwayland(&window);
                 keyboard.set_focus(self, Some(window.into()), serial);
                 return;
             }
