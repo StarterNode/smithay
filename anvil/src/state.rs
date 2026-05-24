@@ -570,17 +570,11 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
         &mut self.xdg_activation_state
     }
 
-    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        if let Some((serial, seat)) = data.serial {
-            let keyboard = self.human_seat.get_keyboard().unwrap();
-            Seat::from_resource(&seat) == Some(self.human_seat.clone())
-                && keyboard
-                    .last_enter()
-                    .map(|last_enter| serial.is_no_older_than(&last_enter))
-                    .unwrap_or(false)
-        } else {
-            false
-        }
+    fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        // DESKTOP-001 P2 — permissive policy delegated to compstr. amiaOS
+        // threat model is single-user / single-launcher / first-party; no
+        // focus-thief. See compstr::activation for full rationale.
+        compstr::activation::accept_token_permissive(&token, &data)
     }
 
     fn request_activation(
