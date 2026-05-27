@@ -6,6 +6,7 @@ pub use compstr::mirror::{MirrorState, PendingFrame};
 pub use compstr::seats::seat_can_view;
 pub use compstr::ipc::{IpcCommand, IpcHandler};
 pub use compstr::screen::export::ExportState;
+pub use compstr::screen::xwayland_rootful::{XwaylandRootful, XWAYLAND_ROOTFUL_OUTPUT_NAME};
 
 // Implement WlSurfaceAccessor for WindowElement so compstr's surface-based
 // lookups work with anvil's window type.

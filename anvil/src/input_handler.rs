@@ -68,22 +68,19 @@ use smithay::{
 };
 
 impl<BackendData: Backend> AnvilState<BackendData> {
-    /// Return the active pointer handle (AI seat in copilot mode, human seat otherwise).
+    /// Return the active pointer handle. CPIT-033 P4b (audit outcome (a)
+    /// 2026-05-26): physical HID always routes to human_pointer under Path 3.
+    /// Drive-mode redirection is handled by cpit's full-screen layer surface
+    /// in DriveMode + cpit's xpra_client forwarding to xpra — anvil-side
+    /// drive_mode no longer affects this dispatch.
     fn active_pointer(&self) -> PointerHandle<AnvilState<BackendData>> {
-        if self.copilot_mode.is_some() {
-            self.ai_pointer.clone()
-        } else {
-            self.human_pointer.clone()
-        }
+        self.human_pointer.clone()
     }
 
-    /// Return a reference to the active seat (AI seat in copilot mode, human seat otherwise).
+    /// Return a reference to the active seat. CPIT-033 P4b — same rationale
+    /// as active_pointer(); always human_seat under Path 3.
     fn active_seat(&self) -> &Seat<AnvilState<BackendData>> {
-        if self.copilot_mode.is_some() {
-            &self.ai_seat
-        } else {
-            &self.human_seat
-        }
+        &self.human_seat
     }
 
     // Allow in this method because of existing usage
@@ -368,20 +365,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
-
-
-        // In copilot mode, hit-test against the active AI workspace's Space directly.
-        // AI workspaces have no layer-shell surfaces — just window elements.
-        if let Some(ws_id) = self.copilot_mode {
-            if let Some(space) = self.workspaces.get_space(ws_id) {
-                return space.element_under(pos).and_then(|(window, loc)| {
-                    window
-                        .surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
-                        .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
-                });
-            }
-        }
-
         let output = self.workspaces.space().outputs().find(|o| {
             let geometry = self.workspaces.space().output_geometry(o).unwrap();
             geometry.contains(pos.to_i32_round())

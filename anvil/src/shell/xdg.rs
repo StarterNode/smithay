@@ -21,7 +21,7 @@ use smithay::{
         seat::WaylandFocus,
         shell::xdg::{
             Configure, PopupSurface, PositionerState, ToplevelCachedState, ToplevelSurface, XdgShellHandler,
-            XdgShellState,
+            XdgShellState, XdgToplevelSurfaceData,
         },
     },
 };
@@ -327,13 +327,22 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 .find(|element| element.wl_surface().as_deref() == Some(&surface));
             if let Some(window) = window {
                 use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+                // Desktop-kiosk override: the daedalOS parent kiosk renders edge-to-edge
+                // with zero decorations regardless of fullscreen/decoration_mode state
+                // (COMPSTR-KIOSK-DESKTOP-DECORATION-001).
+                let app_id = with_states(&surface, |states| {
+                    states.data_map.get::<XdgToplevelSurfaceData>()
+                        .and_then(|data| data.lock().ok().and_then(|d| d.app_id.clone()))
+                }).unwrap_or_default();
                 // Suppress SSD for fullscreen windows — ack_configure fires on every
                 // configure, so without this check SSD would re-enable during fullscreen
                 let is_fullscreen = configure
                     .state
                     .states
                     .contains(xdg_toplevel::State::Fullscreen);
-                let is_ssd = if is_fullscreen {
+                let is_ssd = if compstr::desktop_kiosk::is_desktop_kiosk(&app_id) {
+                    false
+                } else if is_fullscreen {
                     false
                 } else {
                     // If decoration was negotiated via xdg-decoration, respect it.
@@ -393,12 +402,24 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                 state.size = Some(geometry.size);
                 state.fullscreen_output = wl_output;
             });
-            output.user_data().insert_if_missing(FullscreenSurface::default);
-            output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .unwrap()
-                .set(window.clone());
+            // Human-workspace fullscreen exception: surfaces on the main socket (ws_id == None
+            // or Some(0)) get Fullscreen STATE for chromium sizing, but we skip registering
+            // them as the output's FullscreenSurface. The render path's FullscreenSurface
+            // branch (anvil/src/render.rs:155) bypasses layer-shell rendering; staying in Space
+            // keeps cpit topbar visible above the kiosk via the normal space_render_elements
+            // path. Reading app_id here is unreliable — smithay fires fullscreen_request before
+            // pending->current commit, so app_id is None at this point (race observed live
+            // 2026-05-15). ws_id is set per-client at connect time and stable here.
+            // (COMPSTR-KIOSK-DESKTOP-DECORATION-001)
+            let is_human_workspace = ws_id.unwrap_or(0) == 0;
+            if !is_human_workspace {
+                output.user_data().insert_if_missing(FullscreenSurface::default);
+                output
+                    .user_data()
+                    .get::<FullscreenSurface>()
+                    .unwrap()
+                    .set(window.clone());
+            }
             trace!("Fullscreening: {:?}", window);
 
             // Reposition element to fullscreen geometry origin — same pattern as maximize_request
@@ -865,6 +886,44 @@ fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface)
         .elements()
         .find(|w| w.wl_surface().as_deref() == Some(surface))
         .cloned()?;
+
+    // COMPSTR-KIOSK-DESKTOP-DECORATION-001: the daedalOS desktop kiosk owns the
+    // whole output, edge-to-edge, with no decorations — DETERMINISTICALLY, not
+    // contingent on Chromium choosing to call fullscreen_request (it does so only
+    // intermittently, which is the "decorations come back / not full screen" bug).
+    // app_id is reliably set by the time commits flow here, so we force Fullscreen
+    // + output-size + SSD-off, idempotently: the `settled` guard skips re-configuring
+    // once the window has converged on the output rect (no configure feedback loop).
+    let app_id = with_states(surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().ok().and_then(|d| d.app_id.clone()))
+    })
+    .unwrap_or_default();
+    if compstr::desktop_kiosk::is_desktop_kiosk(&app_id) {
+        // Bind to a `let` first so the immutable borrow from outputs()/output_geometry()
+        // ends here (Rectangle is Copy) and does not outlive into the map_element() below.
+        let output_geo = space.outputs().next().and_then(|o| space.output_geometry(o));
+        if let Some(geo) = output_geo {
+            let settled = space
+                .element_geometry(&window)
+                .map(|r| r.loc == geo.loc && r.size == geo.size)
+                .unwrap_or(false);
+            if !settled {
+                if let Some(toplevel) = window.0.toplevel() {
+                    toplevel.with_pending_state(|state| {
+                        state.states.set(xdg_toplevel::State::Fullscreen);
+                        state.size = Some(geo.size);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                window.set_ssd(false);
+                space.map_element(window.clone(), geo.loc, true);
+            }
+        }
+        return Some(());
+    }
 
     let mut window_loc = space.element_location(&window)?;
     let geometry = window.geometry();

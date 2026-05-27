@@ -312,9 +312,10 @@ pub fn run_x11() {
 
     let ai_socket = state.ensure_workspace_socket(ai_ws);
 
-    // Chromium kiosk on workspace 1 — loads AI desktop from systemd-managed guide-server,
-    // gives compstr something to export. guide-server.service is up before anvil per
-    // After=network-online.target / WantedBy=multi-user.target.
+    // Chromium kiosk on workspace 1 — loads xpra's HTML5 client (port 14501,
+    // served by manji-xpra.service). XPRA-006 (2026-05-26) routed from
+    // guide-server (port 9100) to xpra-html5 per the xpra-inversion architecture
+    // documented at /amia/agency/xpra/xpra.json operations.architecture.boot_flow.
     // Kiosk profile lives at /var/kiosk/aidesktop (created by anvil-packaging postinst).
     match std::process::Command::new("chromium")
         .args(&[
@@ -323,7 +324,7 @@ pub fn run_x11() {
             "--remote-debugging-port=9222",
             "--class=manji.aidesktop",
             "--user-data-dir=/var/kiosk/aidesktop",
-            "--app=http://127.0.0.1:9100/",
+            "--app=http://127.0.0.1:14501/",
         ])
         .env("WAYLAND_DISPLAY", &ai_socket)
         .spawn()

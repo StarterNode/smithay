@@ -160,6 +160,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub axis: compstr::axis::Axis,
     pub mirror: crate::workspace::MirrorState,
     pub export: crate::workspace::ExportState,
+    pub xwayland_rootful: crate::workspace::XwaylandRootful,
     pub cockpit_socket: compstr::socket::CockpitSocket,
     pub stacking: compstr::stacking::StackingOrder<crate::shell::WindowElement>,
     pub popups: PopupManager,
@@ -205,9 +206,20 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub human_pointer: PointerHandle<AnvilState<BackendData>>,
     pub ai_seat: Seat<AnvilState<BackendData>>,
     pub ai_pointer: PointerHandle<AnvilState<BackendData>>,
-    /// Copilot mode — when set, physical input routes to ai_seat for direct
-    /// human control of AI workspace. None = normal (human_seat). Some(id) = copilot.
-    pub copilot_mode: Option<crate::workspace::WorkspaceId>,
+    /// Drive-mode flag (CPIT-033 P4b, renamed from copilot_mode 2026-05-26 —
+    /// "copilot_mode" was dead nomenclature). Semantics: represents HUMAN
+    /// PRESENCE in drive-mode view, not AI activity. Some(workspace_id) =
+    /// human is peering into that AI workspace via cpit's GL surface; None =
+    /// human is back on their own desktop. The AI workspace runs in xpra
+    /// CONTINUOUSLY regardless of this flag — drive_mode=None does NOT mean
+    /// "AI is idle." Set by EngagePeacock IPC, cleared by DisengagePeacock.
+    /// As of CPIT-033 P4b (audit outcome (a)), the input dispatch reads in
+    /// input_handler.rs no longer branch on this flag — physical HID always
+    /// routes to human_seat under Path 3 because cpit's full-screen layer
+    /// surface captures everything in DriveMode and forwards via xpra_client.
+    /// Retained for telemetry/observability (alois knowing 'human is watching').
+    #[allow(dead_code)]
+    pub drive_mode: Option<crate::workspace::WorkspaceId>,
 
     #[cfg(feature = "xwayland")]
     pub xwm: Option<X11Wm>,
@@ -329,7 +341,9 @@ const _: () = {
 
         fn can_view(client: Client, global_data: &WlOutputData) -> bool {
             let output_name = global_data.output.name();
-            let is_virtual = output_name == "AI-Desktop";
+            // XPRA-008: Xwayland-Rootful is the second AI-workspace virtual output.
+            let is_virtual = output_name == "AI-Desktop"
+                || output_name == crate::workspace::XWAYLAND_ROOTFUL_OUTPUT_NAME;
             let client_ws = client
                 .get_data::<ClientState>()
                 .and_then(|cs| cs.workspace_id.lock().ok().and_then(|g| *g));
@@ -1007,6 +1021,14 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             es
         };
 
+        // XPRA-008 — Xwayland-Rootful virtual output. Same wl_output advertise
+        // pattern as export; visibility gated by can_view to AI workspace clients.
+        let xwayland_rootful = {
+            let xr = crate::workspace::XwaylandRootful::new();
+            let _global = xr.output().create_global::<AnvilState<BackendData>>(&dh);
+            xr
+        };
+
         let mut state = AnvilState {
             backend_data,
             display_handle: dh,
@@ -1017,6 +1039,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             axis: compstr::axis::Axis::new(),
             mirror: crate::workspace::MirrorState::new(),
             export,
+            xwayland_rootful,
             cockpit_socket: compstr::socket::CockpitSocket::new(),
             stacking: compstr::stacking::StackingOrder::new(),
             popups: PopupManager::default(),
@@ -1054,7 +1077,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             human_pointer,
             ai_seat,
             ai_pointer,
-            copilot_mode: None,
+            drive_mode: None,
             clock,
 
             #[cfg(feature = "xwayland")]

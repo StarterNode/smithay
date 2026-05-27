@@ -554,14 +554,23 @@ pub fn run_udev() {
         space.map_output(state.export.output(), (0, 0));
         state.export.set_output_mapped_to(ai_ws);
         info!("Mapped export output to workspace {}", ai_ws);
+        // XPRA-008 — Xwayland-Rootful sibling virtual output (1920x1200).
+        // Offset to (0, 1100) so it doesn't overlap AI-Desktop's 1920x1080 quad
+        // in workspace 1's coordinate space. Xwayland's -output Xwayland-Rootful
+        // flag pins its fullscreen surface here. No physical scanout — anvil
+        // never renders this output to eDP-1.
+        space.map_output(state.xwayland_rootful.output(), (0, 1100));
+        info!("Mapped Xwayland-Rootful output to workspace {}", ai_ws);
     }
 
     let ai_socket = state.ensure_workspace_socket(ai_ws);
 
-    // Chromium kiosk on workspace 1 — loads AI desktop from systemd-managed guide-server,
-    // gives compstr something to export. guide-server.service is up before anvil per
-    // After=network-online.target / WantedBy=multi-user.target.
-    // Kiosk profile lives at /var/kiosk/aidesktop (created by anvil-packaging postinst).
+    // AI workspace kiosk — loads xpra's HTML5 client (served by `xpra start :100
+    // --bind-tcp=127.0.0.1:14501 --html=/amia/agency/xpra/launcher`). This is
+    // what cpit's DriveMode views via DMA-BUF; clicks forwarded through cpit's
+    // xpra unix-socket client appear at the xpra Xvfb behind this canvas.
+    // XPRA-006 (2026-05-26) — was http://127.0.0.1:9100/wallpaper (guide-server
+    // wallpaper page); routed to xpra-html5 per xpra.json operations.architecture.
     match std::process::Command::new("chromium")
         .args(&[
             "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
@@ -569,13 +578,44 @@ pub fn run_udev() {
             "--remote-debugging-port=9222",
             "--class=manji.aidesktop",
             "--user-data-dir=/var/kiosk/aidesktop",
-            "--app=http://127.0.0.1:9100/",
+            "--app=http://127.0.0.1:14501/",
         ])
         .env("WAYLAND_DISPLAY", &ai_socket)
         .spawn()
     {
-        Ok(child) => info!("Spawned Chromium kiosk (pid {}) on workspace {} via {}", child.id(), ai_ws, ai_socket),
-        Err(e) => error!("Failed to spawn Chromium kiosk: {}", e),
+        Ok(child) => info!("Spawned AI workspace Chromium kiosk (pid {}) on workspace {} via {}", child.id(), ai_ws, ai_socket),
+        Err(e) => error!("Failed to spawn AI workspace Chromium kiosk: {}", e),
+    }
+
+    // DESKTOP-NOOP-2026-05-27 — daedal kiosk spawn temp-disabled by CC per CEO
+    // direction (focus on other parts of system). To re-enable: change the
+    // `if false {` below back to `if let Some(ref socket_name) = state.socket_name {`
+    // (and remove the `let _ = socket_name_unused;` no-op line + matching outer
+    // brace). See /amia/agency/GUIde/desktop/audit.json#DESKTOP-NOOP-2026-05-27
+    // for full revert instructions + when-to-undo.
+    //
+    // Human workspace daedalOS kiosk — full desktop UI at /, borderless under topbar.
+    // Spawned on the main socket so cpit (topbar/sidebar) + this kiosk share the
+    // human-visible Wayland surface. Borderless suppression: compstr::desktop_kiosk
+    // recognizes wm_class=manji.desktop in xdg.rs ack_configure SSD-skip path.
+    if false {
+        if let Some(ref socket_name) = state.socket_name {
+            match std::process::Command::new("chromium")
+                .args(&[
+                    "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
+                    "--enable-features=UseOzonePlatform", "--ozone-platform=wayland",
+                    "--remote-debugging-port=9223",
+                    "--class=manji.desktop",
+                    "--user-data-dir=/var/kiosk/desktop",
+                    "--app=http://127.0.0.1:9100/",
+                ])
+                .env("WAYLAND_DISPLAY", socket_name)
+                .spawn()
+            {
+                Ok(child) => info!("Spawned human-workspace daedal kiosk (pid {}) via {}", child.id(), socket_name),
+                Err(e) => error!("Failed to spawn human-workspace daedal kiosk: {}", e),
+            }
+        }
     }
 
     // Supervised compilr daemon — waits for CDP, restarts on crash

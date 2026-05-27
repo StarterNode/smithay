@@ -114,20 +114,54 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 ipc::success(json!(list))
             }
 
-            IpcCommand::Switch { id } => {
-                if id == 0 {
-                    self.workspaces.set_active_workspace(0);
-                    self.copilot_mode = None;
-                    info!("IPC: switched to desktop (copilot off)");
-                    ipc::success(json!({"id": 0, "copilot": false}))
-                } else if self.workspaces.get_space(id).is_none() {
+            IpcCommand::EngagePeacock { id } => {
+                // CPIT-033 P4b — Engage drive-mode (flag set; active_workspace UNCHANGED).
+                // XPRA-008 P4 (2026-05-27 evening pivot) — also relocate Xwayland-Rootful's
+                // wl_output from the AI workspace's Space into workspace 0's Space so the
+                // human pointer (which lives on ws0) naturally finds Xwayland's surface
+                // below cpit's 44x44 input-region. No surface_under override; pure topology.
+                if self.workspaces.get_space(id).is_none() {
                     ipc::error_response(&format!("workspace {} not found", id))
                 } else {
-                    self.workspaces.set_active_workspace(id);
-                    self.copilot_mode = Some(id);
-                    info!("IPC: switched to workspace {} (copilot on)", id);
-                    ipc::success(json!({"id": id, "copilot": true}))
+                    self.drive_mode = Some(id);
+                    let xwl_output = self.xwayland_rootful.output().clone();
+                    let moved = self.workspaces.reassign_output_to_workspace(
+                        &xwl_output,
+                        id,
+                        0,
+                        (0, 0).into(),
+                    );
+                    info!(
+                        "IPC: drive engaged — human peering into workspace {} (xwayland_rootful relocated to ws0: {})",
+                        id, moved
+                    );
+                    ipc::success(json!({"id": id, "drive": true, "xwayland_relocated": moved}))
                 }
+            }
+
+            IpcCommand::DisengagePeacock => {
+                // CPIT-033 P4b — Disengage drive-mode flag.
+                // XPRA-008 P4 — capture current drive workspace BEFORE clearing the flag,
+                // then move Xwayland-Rootful's wl_output back home from ws0. (0, 1100)
+                // matches the startup mapping at udev.rs:562 so AI workspace coords stay
+                // consistent across engage/disengage cycles.
+                let restored = if let Some(prev_id) = self.drive_mode {
+                    let xwl_output = self.xwayland_rootful.output().clone();
+                    self.workspaces.reassign_output_to_workspace(
+                        &xwl_output,
+                        0,
+                        prev_id,
+                        (0, 1100).into(),
+                    )
+                } else {
+                    false
+                };
+                self.drive_mode = None;
+                info!(
+                    "IPC: drive disengaged — human back on desktop (xwayland_rootful restored: {})",
+                    restored
+                );
+                ipc::success(json!({"drive": false, "xwayland_restored": restored}))
             }
 
             IpcCommand::Spawn { id, command, args } => {

@@ -5,6 +5,17 @@ license = "MIT"
 name = "anvil"
 publish = false
 version = "0.0.1"
+description = "amiaOS Wayland compositor (anvil)"
+
+[package.metadata.deb]
+maintainer = "Manji <admin@manji.ai>"
+copyright = "2026, Manji"
+extended-description = "anvil — the amiaOS Wayland compositor (Smithay-based). Session leader launched by greetd/wlgreet."
+section = "misc"
+priority = "optional"
+assets = [
+    ["target/release/anvil", "usr/local/bin/", "755"],
+]
 
 [dependencies]
 bitflags = "2.2.1"
