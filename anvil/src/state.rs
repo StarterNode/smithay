@@ -206,20 +206,22 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub human_pointer: PointerHandle<AnvilState<BackendData>>,
     pub ai_seat: Seat<AnvilState<BackendData>>,
     pub ai_pointer: PointerHandle<AnvilState<BackendData>>,
-    /// Drive-mode flag (CPIT-033 P4b, renamed from copilot_mode 2026-05-26 —
-    /// "copilot_mode" was dead nomenclature). Semantics: represents HUMAN
-    /// PRESENCE in drive-mode view, not AI activity. Some(workspace_id) =
-    /// human is peering into that AI workspace via cpit's GL surface; None =
-    /// human is back on their own desktop. The AI workspace runs in xpra
-    /// CONTINUOUSLY regardless of this flag — drive_mode=None does NOT mean
-    /// "AI is idle." Set by EngagePeacock IPC, cleared by DisengagePeacock.
-    /// As of CPIT-033 P4b (audit outcome (a)), the input dispatch reads in
-    /// input_handler.rs no longer branch on this flag — physical HID always
-    /// routes to human_seat under Path 3 because cpit's full-screen layer
-    /// surface captures everything in DriveMode and forwards via xpra_client.
-    /// Retained for telemetry/observability (alois knowing 'human is watching').
+    /// Drive-mode flag. Some(workspace_id) = human is peering into that AI
+    /// workspace via cpit's DMA-BUF mirror; None = human is back on their own
+    /// desktop. The AI workspace runs in xpra continuously regardless. Set by
+    /// EngagePeacock IPC, cleared by DisengagePeacock. XPRA-008 bridge reads
+    /// this in concert with drive_mode_target below.
     #[allow(dead_code)]
     pub drive_mode: Option<crate::workspace::WorkspaceId>,
+
+    /// XPRA-008 bridge target. Some(kiosk_surface) = drive mode engaged AND we
+    /// found the manji.aidesktop chromium kiosk WindowElement on ws_ai; the
+    /// input_handler short-circuits human pointer + keyboard events to this
+    /// surface whenever the pointer falls inside the cpit mirror rect (which
+    /// is the eDP-1 output geometry under the fullscreen-mirror assumption).
+    /// Cleared on DisengagePeacock. Lookup happens fresh on each engage so a
+    /// dead kiosk client doesn't leave a stale surface ref.
+    pub drive_mode_target: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
 
     #[cfg(feature = "xwayland")]
     pub xwm: Option<X11Wm>,
@@ -1078,6 +1080,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             ai_seat,
             ai_pointer,
             drive_mode: None,
+            drive_mode_target: None,
             clock,
 
             #[cfg(feature = "xwayland")]

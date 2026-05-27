@@ -239,6 +239,19 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             .unwrap_or(KeyAction::None);
 
         self.suppressed_keys = suppressed_keys;
+
+        // XPRA-008 bridge: in drive mode, ALSO dispatch the key through ai_seat
+        // keyboard so the chromium kiosk on ws_ai (which only sees the AI seat
+        // per compstr's two-seat filter) receives it. The human_seat dispatch
+        // above keeps anvil's shortcut interception path intact for Super+W etc.
+        if self.drive_mode_target.is_some() {
+            if let Some(ai_kb) = self.ai_seat.get_keyboard() {
+                let _ = ai_kb.input::<(), _>(self, keycode, state, serial, time, |_, _, _| {
+                    FilterResult::Forward
+                });
+            }
+        }
+
         action
     }
 
@@ -253,6 +266,34 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if wl_pointer::ButtonState::Pressed == state {
             self.update_keyboard_focus(pointer.current_location(), serial);
         };
+
+        // XPRA-008 bridge: in drive mode, ALSO dispatch button event via ai_pointer
+        // to chromium kiosk's wl_surface (kiosk on ws_ai only sees the AI seat).
+        // human_pointer dispatches as normal — events to ws_ai surfaces from human
+        // seat are silently dropped client-side (no human wl_seat binding there);
+        // events to peacock surfaces on ws_0 from human seat work normally so the
+        // floating peacock escape hatch still fires.
+        if let Some(kiosk) = self.drive_mode_target.clone() {
+            let loc = self.human_pointer.current_location();
+            let ai_pointer = self.ai_pointer.clone();
+            // Ensure ai_pointer has entered the kiosk surface at the current loc
+            ai_pointer.motion(
+                self,
+                Some((PointerFocusTarget::from(kiosk.clone()), (0.0, 0.0).into())),
+                &MotionEvent { location: loc, serial, time: evt.time_msec() },
+            );
+            ai_pointer.button(
+                self,
+                &ButtonEvent {
+                    button,
+                    state: state.try_into().unwrap(),
+                    serial,
+                    time: evt.time_msec(),
+                },
+            );
+            ai_pointer.frame(self);
+        }
+
         pointer.button(
             self,
             &ButtonEvent {
@@ -425,6 +466,27 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             under = Some(focus)
         };
+
+        // XPRA-008 bridge — drive mode active + no Overlay/Top/Bottom/Background
+        // surface found OR element_under returned nothing visible on ws_0. Route
+        // pointer to the chromium kiosk wl_surface on ws_ai. Goes AFTER the layer
+        // checks so cpit's floating peacock (rendered on cpit's main layer which
+        // is on Bottom in drive mode with input_region narrowed to 44x44) reaches
+        // cpit normally and the escape hatch works. Under fullscreen-mirror
+        // assumption (mirror = eDP-1 full geometry, kiosk = ws_ai fullscreen) the
+        // surface origin is (0,0) — pointer coords pass through identity.
+        if under.is_none() {
+            if let Some(kiosk) = self.drive_mode_target.as_ref() {
+                tracing::info!(
+                    "XPRA-008 BRIDGE: surface_under returning kiosk surface at pos {:?}",
+                    pos
+                );
+                under = Some((
+                    PointerFocusTarget::from(kiosk.clone()),
+                    output_geo.loc,
+                ));
+            }
+        }
         under.map(|(s, l)| (s, l.to_f64()))
     }
 
@@ -893,6 +955,24 @@ impl AnvilState<UdevData> {
             },
         );
         pointer.frame(self);
+
+        // XPRA-008 bridge: in drive mode, ALSO dispatch motion via ai_pointer
+        // targeting the chromium kiosk wl_surface. Kiosk client on ws_ai only
+        // sees the AI seat (compstr two-seat filter); without this parallel
+        // dispatch the kiosk never receives pointer events.
+        if let Some(kiosk) = self.drive_mode_target.clone() {
+            let ai_pointer = self.ai_pointer.clone();
+            ai_pointer.motion(
+                self,
+                Some((PointerFocusTarget::from(kiosk), (0.0, 0.0).into())),
+                &MotionEvent {
+                    location: pointer_location,
+                    serial,
+                    time: evt.time_msec(),
+                },
+            );
+            ai_pointer.frame(self);
+        }
 
         // If pointer is now in a constraint region, activate it
         // TODO Anywhere else pointer is moved needs to do this

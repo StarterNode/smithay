@@ -16,6 +16,34 @@ use tracing::{error, info, warn};
 use compstr::ipc::{self, IpcCommand, IpcHandler};
 use compstr::workspace::WorkspaceId;
 use crate::state::{AnvilState, Backend, ClientState};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+
+/// XPRA-008 bridge — locate the chromium kiosk wl_surface on the given workspace.
+/// Walks the workspace's space.elements() and matches xdg_toplevel.app_id against
+/// compstr::system_apps::is_aidesktop. Returns None if no kiosk found OR if its
+/// wl_surface has been dropped. Called fresh on each EngagePeacock so stale refs
+/// don't leak across engagements.
+fn find_kiosk_surface<B: Backend + 'static>(
+    state: &AnvilState<B>,
+    workspace_id: WorkspaceId,
+) -> Option<WlSurface> {
+    let space = state.workspaces.get_space(workspace_id)?;
+    for elem in space.elements() {
+        let surface = elem.wl_surface()?;
+        let app_id = with_states(&surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok().and_then(|d| d.app_id.clone()))
+        }).unwrap_or_default();
+        if compstr::system_apps::is_aidesktop(&app_id) {
+            return Some(surface.into_owned());
+        }
+    }
+    None
+}
 
 /// AnvilState implements IpcHandler so compstr::ipc::setup_ipc_watch can
 /// call back into the compositor without knowing about AnvilState internals.
@@ -115,53 +143,69 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             }
 
             IpcCommand::EngagePeacock { id } => {
-                // CPIT-033 P4b — Engage drive-mode (flag set; active_workspace UNCHANGED).
-                // XPRA-008 P4 (2026-05-27 evening pivot) — also relocate Xwayland-Rootful's
-                // wl_output from the AI workspace's Space into workspace 0's Space so the
-                // human pointer (which lives on ws0) naturally finds Xwayland's surface
-                // below cpit's 44x44 input-region. No surface_under override; pure topology.
+                // XPRA-008 bridge architecture (2026-05-27 late evening pivot, supersedes
+                // the prior output-reassignment ship at ca1b596). On engage we look up
+                // the chromium kiosk wl_surface on ws_ai by app_id == manji.aidesktop
+                // (compstr::system_apps::is_aidesktop) and store it on AnvilState so the
+                // input_handler can short-circuit human pointer + keyboard events
+                // directly to it when the pointer is over cpit's mirror rect. Keeps
+                // ws_0 and ws_ai fully isolated — only the input plane crosses the gap.
                 if self.workspaces.get_space(id).is_none() {
-                    ipc::error_response(&format!("workspace {} not found", id))
-                } else {
-                    self.drive_mode = Some(id);
-                    let xwl_output = self.xwayland_rootful.output().clone();
-                    let moved = self.workspaces.reassign_output_to_workspace(
-                        &xwl_output,
-                        id,
-                        0,
-                        (0, 0).into(),
-                    );
-                    info!(
-                        "IPC: drive engaged — human peering into workspace {} (xwayland_rootful relocated to ws0: {})",
-                        id, moved
-                    );
-                    ipc::success(json!({"id": id, "drive": true, "xwayland_relocated": moved}))
+                    return ipc::error_response(&format!("workspace {} not found", id));
                 }
+                self.drive_mode = Some(id);
+
+                let kiosk_surface = find_kiosk_surface(self, id);
+                self.drive_mode_target = kiosk_surface.clone();
+
+                // Force keyboard focus to the kiosk for the duration of drive mode so
+                // keystrokes flow to chromium DOM. Set focus on BOTH human and ai
+                // seat — kiosk client on ws_ai only sees the ai seat per the
+                // compstr two-seat filter (compstr::seats::seat_can_view), so
+                // human-seat focus alone wouldn't reach chromium. Restored on
+                // Disengage.
+                if let Some(kiosk) = kiosk_surface.as_ref() {
+                    let window = self.workspaces.window_for_surface(kiosk);
+                    let kbd_focus = window.map(crate::focus::KeyboardFocusTarget::from);
+                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    if let Some(kb) = self.human_seat.get_keyboard() {
+                        kb.set_focus(self, kbd_focus.clone(), serial);
+                    }
+                    if let Some(kb) = self.ai_seat.get_keyboard() {
+                        kb.set_focus(self, kbd_focus, serial);
+                    }
+                }
+
+                info!(
+                    "IPC: drive engaged — workspace {} (drive_mode_target = {})",
+                    id,
+                    if self.drive_mode_target.is_some() { "Some(kiosk)" } else { "None — kiosk surface not found" }
+                );
+                ipc::success(json!({
+                    "id": id,
+                    "drive": true,
+                    "bridge_armed": self.drive_mode_target.is_some()
+                }))
             }
 
             IpcCommand::DisengagePeacock => {
-                // CPIT-033 P4b — Disengage drive-mode flag.
-                // XPRA-008 P4 — capture current drive workspace BEFORE clearing the flag,
-                // then move Xwayland-Rootful's wl_output back home from ws0. (0, 1100)
-                // matches the startup mapping at udev.rs:562 so AI workspace coords stay
-                // consistent across engage/disengage cycles.
-                let restored = if let Some(prev_id) = self.drive_mode {
-                    let xwl_output = self.xwayland_rootful.output().clone();
-                    self.workspaces.reassign_output_to_workspace(
-                        &xwl_output,
-                        0,
-                        prev_id,
-                        (0, 1100).into(),
-                    )
-                } else {
-                    false
-                };
+                // XPRA-008 bridge — release the kiosk surface + restore keyboard focus
+                // to standard surface_under dispatch.
                 self.drive_mode = None;
+                let was_armed = self.drive_mode_target.is_some();
+                self.drive_mode_target = None;
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                if let Some(kb) = self.human_seat.get_keyboard() {
+                    kb.set_focus(self, None, serial);
+                }
+                if let Some(kb) = self.ai_seat.get_keyboard() {
+                    kb.set_focus(self, None, serial);
+                }
                 info!(
-                    "IPC: drive disengaged — human back on desktop (xwayland_rootful restored: {})",
-                    restored
+                    "IPC: drive disengaged — bridge released (was armed: {})",
+                    was_armed
                 );
-                ipc::success(json!({"drive": false, "xwayland_restored": restored}))
+                ipc::success(json!({"drive": false, "bridge_released": was_armed}))
             }
 
             IpcCommand::Spawn { id, command, args } => {
