@@ -241,7 +241,7 @@ pub fn run_winit() {
             "--remote-debugging-port=9222",
             "--class=manji.aidesktop",
             "--user-data-dir=/var/kiosk/aidesktop",
-            "--app=http://127.0.0.1:14501/",
+            "--app=http://127.0.0.1:9100/ai_desktop",
         ])
         .env("WAYLAND_DISPLAY", &ai_socket)
         .spawn()

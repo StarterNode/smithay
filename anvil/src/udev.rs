@@ -578,7 +578,7 @@ pub fn run_udev() {
             "--remote-debugging-port=9222",
             "--class=manji.aidesktop",
             "--user-data-dir=/var/kiosk/aidesktop",
-            "--app=http://127.0.0.1:14501/",
+            "--app=http://127.0.0.1:9100/ai_desktop",
         ])
         .env("WAYLAND_DISPLAY", &ai_socket)
         .spawn()
@@ -1617,6 +1617,7 @@ impl AnvilState<UdevData> {
                 &mut self.ai_cursor_status,
                 self.ai_pointer.current_location(),
                 &pointer_image,
+                &self.ai_cursor_orb,
             );
         }
 
@@ -1911,6 +1912,7 @@ fn render_mirror_frames(
     ai_cursor_status: &mut CursorImageStatus,
     ai_pointer_location: Point<f64, Logical>,
     pointer_image: &MemoryRenderBuffer,
+    ai_cursor_orb: &MemoryRenderBuffer,
 ) {
     use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
     use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -2012,38 +2014,30 @@ fn render_mirror_frames(
         use crate::drawing::PointerElement;
         use crate::render::{CustomRenderElements, OutputRenderElements};
         use smithay::backend::renderer::element::AsRenderElements;
-        use smithay::input::pointer::CursorImageAttributes;
-        use smithay::wayland::compositor;
-        use std::sync::Mutex;
+        // AWARE-003 — replaced cursor-status-machinery with orb override below;
+        // CursorImageAttributes / Mutex / compositor::with_states no longer used.
 
         let scale = Scale::from(output.current_scale().fractional_scale());
         let mut mirror_pointer = PointerElement::default();
-        mirror_pointer.set_buffer(pointer_image.clone());
+        // AWARE-003 — Use the AI cursor orb buffer instead of the system pointer
+        // image, and FORCE the cursor status to Named so PointerElement renders
+        // the buffer (the orb) regardless of what chromium attached via
+        // wl_pointer.set_cursor. Discards chromium-side cursor sprite for the
+        // AI workspace's mirror render.
+        mirror_pointer.set_buffer(ai_cursor_orb.clone());
 
-        // Reset cursor if surface is no longer alive
-        let mut reset = false;
+        // Drop chromium's surface cursor if present — the orb replaces it for
+        // visual purposes. We still want to ignore stale dead surfaces.
         if let CursorImageStatus::Surface(ref surface) = *ai_cursor_status {
-            reset = !surface.alive();
+            if !surface.alive() {
+                *ai_cursor_status = CursorImageStatus::default_named();
+            }
         }
-        if reset {
-            *ai_cursor_status = CursorImageStatus::default_named();
-        }
-        mirror_pointer.set_status(ai_cursor_status.clone());
+        // Always render via the Named branch so PointerElement uses our orb buffer.
+        mirror_pointer.set_status(CursorImageStatus::default_named());
 
-        // Compute hotspot from cursor surface if available
-        let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = *ai_cursor_status {
-            compositor::with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<Mutex<CursorImageAttributes>>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .hotspot
-            })
-        } else {
-            (0, 0).into()
-        };
+        // Hotspot: orb is symmetric (24x24), so hotspot is the center (12, 12).
+        let cursor_hotspot: smithay::utils::Point<i32, smithay::utils::Logical> = (12, 12).into();
 
         // AI pointer location is already in logical coords relative to workspace origin
         let cursor_pos = ai_pointer_location;

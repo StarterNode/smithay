@@ -157,6 +157,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // desktop
     pub workspaces: crate::workspace::WorkspaceManager<crate::shell::WindowElement>,
+    // (orb factory defined at module bottom; field initialized in constructor)
     pub axis: compstr::axis::Axis,
     pub mirror: crate::workspace::MirrorState,
     pub export: crate::workspace::ExportState,
@@ -222,6 +223,13 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// Cleared on DisengagePeacock. Lookup happens fresh on each engage so a
     /// dead kiosk client doesn't leave a stale surface ref.
     pub drive_mode_target: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+
+    /// AWARE-003 — AI cursor orb sprite. Replaces the default Adwaita
+    /// arrow / chromium's wl_pointer.set_cursor sprite for the ai_pointer
+    /// rendered into the kiosk framebuffer. Generated once at AnvilState
+    /// construction: 24x24 ARGB8888, Manji indigo (#3D4AAA) solid center
+    /// fading linearly to alpha 0 at radius 12. Hotspot is the center.
+    pub ai_cursor_orb: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
 
     #[cfg(feature = "xwayland")]
     pub xwm: Option<X11Wm>,
@@ -1081,6 +1089,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             ai_pointer,
             drive_mode: None,
             drive_mode_target: None,
+            ai_cursor_orb: build_ai_cursor_orb(),
             clock,
 
             #[cfg(feature = "xwayland")]
@@ -1534,4 +1543,44 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
     fn update_led_state(&mut self, led_state: LedState);
+}
+
+/// AWARE-003 — Build the AI cursor orb sprite (24x24 ARGB8888, Manji indigo
+/// fading to alpha 0 at radius 12, pre-multiplied alpha). Called once at
+/// AnvilState construction. Used by udev.rs render_mirror_frames to replace
+/// the default cursor with a brand orb for the AI pointer.
+fn build_ai_cursor_orb() -> smithay::backend::renderer::element::memory::MemoryRenderBuffer {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+    use smithay::utils::Transform;
+    let size = 24i32;
+    let radius = 12.0f64;
+    let center = 12.0f64;
+    let (cr, cg, cb) = (0x3Du8, 0x4Au8, 0xAAu8); // Manji indigo
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f64 - center + 0.5;
+            let dy = y as f64 - center + 0.5;
+            let r = (dx * dx + dy * dy).sqrt();
+            let alpha = if r >= radius { 0.0 } else { (1.0 - r / radius).clamp(0.0, 1.0) };
+            let a = (alpha * 255.0).round() as u8;
+            // Pre-multiplied alpha; Fourcc::Argb8888 in DRM little-endian = BGRA byte order.
+            let b_premul = ((cb as f64) * alpha).round() as u8;
+            let g_premul = ((cg as f64) * alpha).round() as u8;
+            let r_premul = ((cr as f64) * alpha).round() as u8;
+            pixels.push(b_premul);
+            pixels.push(g_premul);
+            pixels.push(r_premul);
+            pixels.push(a);
+        }
+    }
+    MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (size, size),
+        1,
+        Transform::Normal,
+        None,
+    )
 }

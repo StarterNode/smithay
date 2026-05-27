@@ -274,13 +274,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // events to peacock surfaces on ws_0 from human seat work normally so the
         // floating peacock escape hatch still fires.
         if let Some(kiosk) = self.drive_mode_target.clone() {
-            let loc = self.human_pointer.current_location();
+            let scaled = self.drive_scale(self.human_pointer.current_location());
             let ai_pointer = self.ai_pointer.clone();
-            // Ensure ai_pointer has entered the kiosk surface at the current loc
+            // Ensure ai_pointer has entered the kiosk surface at the scaled coord
             ai_pointer.motion(
                 self,
                 Some((PointerFocusTarget::from(kiosk.clone()), (0.0, 0.0).into())),
-                &MotionEvent { location: loc, serial, time: evt.time_msec() },
+                &MotionEvent { location: scaled, serial, time: evt.time_msec() },
             );
             ai_pointer.button(
                 self,
@@ -400,6 +400,25 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 }
             };
         }
+    }
+
+    /// XPRA-008 bridge — translate an eDP-1 pointer position to the chromium
+    /// kiosk's wl_surface coordinate space. cpit stretches the kiosk's
+    /// 1920x1080 DMA-BUF onto its 1920x1200 layer surface on eDP-1; without
+    /// this scaling the kiosk's perceived pointer y diverges from anvil's
+    /// hardware cursor y by ~10% (worst at the bottom of the screen).
+    /// Identity when no eDP-1 / no kiosk export output / sizes match.
+    pub fn drive_scale(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        let output_size = self.workspaces.space()
+            .outputs()
+            .find_map(|o| self.workspaces.space().output_geometry(o).map(|g| g.size))
+            .unwrap_or_else(|| (1920, 1200).into());
+        let kiosk_size = self.export.output().current_mode()
+            .map(|m| m.size)
+            .unwrap_or_else(|| (1920, 1080).into());
+        let scale_x = kiosk_size.w as f64 / output_size.w as f64;
+        let scale_y = kiosk_size.h as f64 / output_size.h as f64;
+        (pos.x * scale_x, pos.y * scale_y).into()
     }
 
     pub fn surface_under(
@@ -959,14 +978,19 @@ impl AnvilState<UdevData> {
         // XPRA-008 bridge: in drive mode, ALSO dispatch motion via ai_pointer
         // targeting the chromium kiosk wl_surface. Kiosk client on ws_ai only
         // sees the AI seat (compstr two-seat filter); without this parallel
-        // dispatch the kiosk never receives pointer events.
+        // dispatch the kiosk never receives pointer events. We scale the
+        // pointer position by (kiosk_size / output_size) so the AI cursor
+        // rendered INTO the kiosk frame at ai_pointer.current_location(),
+        // when displayed back through cpit's stretched mirror onto eDP-1,
+        // aligns with anvil's hardware cursor at human_pointer's location.
         if let Some(kiosk) = self.drive_mode_target.clone() {
+            let scaled = self.drive_scale(pointer_location);
             let ai_pointer = self.ai_pointer.clone();
             ai_pointer.motion(
                 self,
                 Some((PointerFocusTarget::from(kiosk), (0.0, 0.0).into())),
                 &MotionEvent {
-                    location: pointer_location,
+                    location: scaled,
                     serial,
                     time: evt.time_msec(),
                 },

@@ -21,28 +21,38 @@ use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 
 /// XPRA-008 bridge — locate the chromium kiosk wl_surface on the given workspace.
-/// Walks the workspace's space.elements() and matches xdg_toplevel.app_id against
-/// compstr::system_apps::is_aidesktop. Returns None if no kiosk found OR if its
-/// wl_surface has been dropped. Called fresh on each EngagePeacock so stale refs
-/// don't leak across engagements.
+/// Walks the workspace's space.elements() and matches xdg_toplevel.app_id by either
+/// the strict is_aidesktop matcher (manji.aidesktop / chrome-127.0.0.1__-Default)
+/// OR the loose chrome-127.0.0.1__*-Default pattern (chromium's URL-app-mode form
+/// for any 127.0.0.1 URL including /ai_desktop, /drive, etc.) OR ANY toplevel on
+/// the workspace as a last-ditch fallback (the AI workspace only ever has the one
+/// kiosk by design). Logs each candidate's app_id for diagnostics — DEMO-DAY-002.
 fn find_kiosk_surface<B: Backend + 'static>(
     state: &AnvilState<B>,
     workspace_id: WorkspaceId,
 ) -> Option<WlSurface> {
     let space = state.workspaces.get_space(workspace_id)?;
+    let mut first_fallback: Option<WlSurface> = None;
+    let mut chromium_fallback: Option<WlSurface> = None;
     for elem in space.elements() {
-        let surface = elem.wl_surface()?;
+        let Some(surface) = elem.wl_surface() else { continue };
         let app_id = with_states(&surface, |states| {
             states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
                 .and_then(|data| data.lock().ok().and_then(|d| d.app_id.clone()))
         }).unwrap_or_default();
+        tracing::info!("XPRA-008 BRIDGE candidate: app_id={:?}", app_id);
         if compstr::system_apps::is_aidesktop(&app_id) {
             return Some(surface.into_owned());
         }
+        // Chromium URL-app-mode forms: chrome-127.0.0.1*Default etc.
+        if app_id.starts_with("chrome-127.0.0.1") && app_id.ends_with("-Default") {
+            chromium_fallback.get_or_insert_with(|| surface.clone().into_owned());
+        }
+        first_fallback.get_or_insert_with(|| surface.clone().into_owned());
     }
-    None
+    chromium_fallback.or(first_fallback)
 }
 
 /// AnvilState implements IpcHandler so compstr::ipc::setup_ipc_watch can
