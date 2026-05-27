@@ -958,6 +958,11 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        // CONTROLR-004 — spawn the clipboard helper daemons (wl-clip-persist
+        // for survival + cliphist text+image watchers for history). They
+        // connect as wlr_data_control clients to the global we just bound.
+        // Idempotent + supervised: see controlr::clipboard module docs.
+        controlr::clipboard::start_daemons();
         let mut seat_state = SeatState::new();
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let viewporter_state = ViewporterState::new::<Self>(&dh);

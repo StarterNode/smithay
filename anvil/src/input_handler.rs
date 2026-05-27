@@ -1462,7 +1462,13 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::ToggleTint)
     } else if modifiers.logo && modifiers.shift && keysym == Keysym::D {
         Some(KeyAction::ToggleDecorations)
-    } else if let Some(cmd) = compstr::hotkeys::keybinds::process_shortcut(&modifiers, keysym) {
+    } else if let Some(cmd) = controlr::hotkeys::process_shortcut(&modifiers, keysym) {
+        // CONTROLR-004 — anvil's hotkey path now calls controlr's
+        // process_shortcut (was compstr's stub). controlr owns hotkey
+        // dispatch + clipboard (Super+V), screenshots (Print), screenrec
+        // (Super+Shift+R). compstr's compstr::hotkeys::keybinds copy stays
+        // as a documented migration leftover until a coherence cleanup
+        // scope retires it.
         Some(KeyAction::Run(cmd.into()))
     } else {
         None
