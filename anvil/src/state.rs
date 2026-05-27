@@ -962,7 +962,11 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         // for survival + cliphist text+image watchers for history). They
         // connect as wlr_data_control clients to the global we just bound.
         // Idempotent + supervised: see controlr::clipboard module docs.
-        controlr::clipboard::start_daemons();
+        // Pass the listening socket name so children can set WAYLAND_DISPLAY
+        // (anvil itself doesn't carry that env var — it IS the compositor).
+        controlr::clipboard::start_daemons(
+            socket_name.as_deref().unwrap_or("wayland-1"),
+        );
         let mut seat_state = SeatState::new();
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
