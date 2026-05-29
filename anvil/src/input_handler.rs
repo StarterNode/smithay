@@ -244,7 +244,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // keyboard so the chromium kiosk on ws_ai (which only sees the AI seat
         // per compstr's two-seat filter) receives it. The human_seat dispatch
         // above keeps anvil's shortcut interception path intact for Super+W etc.
-        if self.drive_mode_target.is_some() {
+        // COMPSTR-DRIVE-PRESENT-002: gate on drive_kb_to_ai so the keyboard
+        // FOLLOWS the click — keys reach the AI only when the last click landed
+        // on the AI view, not when the user is typing into a ws0 window (dispatch).
+        if self.drive_mode_target.is_some() && self.drive_kb_to_ai {
             if let Some(ai_kb) = self.ai_seat.get_keyboard() {
                 let _ = ai_kb.input::<(), _>(self, keycode, state, serial, time, |_, _, _| {
                     FilterResult::Forward
@@ -292,6 +295,37 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 },
             );
             ai_pointer.frame(self);
+
+            // COMPSTR-DRIVE-PRESENT-002 keyboard-follow: make the keyboard track
+            // the click the way the pointer already does. element_under finds a
+            // ws0 window only where one exists (e.g. the dispatch face); the AI
+            // view has no focusable ws0 window under it (that is exactly why the
+            // keyboard used to stay pinned on dispatch). So:
+            //   - click on a ws0 window  -> keep human-seat focus there, do NOT
+            //     duplicate keys into the AI (drive_kb_to_ai = false).
+            //   - click on the AI view   -> release human-seat (dispatch) focus so
+            //     it stops eating keystrokes, and focus the ai-seat keyboard on
+            //     the kiosk (drive_kb_to_ai = true).
+            if wl_pointer::ButtonState::Pressed == state {
+                let on_ws0_window = self
+                    .workspaces
+                    .space()
+                    .element_under(self.human_pointer.current_location())
+                    .is_some();
+                self.drive_kb_to_ai = !on_ws0_window;
+                if !on_ws0_window {
+                    if let Some(human_kb) = self.human_seat.get_keyboard() {
+                        human_kb.set_focus(self, None, serial);
+                    }
+                    if let Some(ai_kb) = self.ai_seat.get_keyboard() {
+                        let target = self
+                            .workspaces
+                            .window_for_surface(&kiosk)
+                            .map(crate::focus::KeyboardFocusTarget::from);
+                        ai_kb.set_focus(self, target, serial);
+                    }
+                }
+            }
         }
 
         pointer.button(

@@ -224,6 +224,15 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// dead kiosk client doesn't leave a stale surface ref.
     pub drive_mode_target: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
 
+    /// COMPSTR-DRIVE-PRESENT-002 keyboard-follow: in drive mode, true when the
+    /// last click landed on the AI view (no ws0 window under the pointer) so the
+    /// keyboard should route to the AI kiosk; false when it landed on a ws0
+    /// window (e.g. the dispatch face) so the keyboard stays there. Mirrors how
+    /// the ai_pointer bridge already makes the POINTER follow the click. Without
+    /// it the keyboard was statically pinned: human-seat focus stuck on dispatch,
+    /// ai-seat focus pinned to the kiosk from EngagePeacock.
+    pub drive_kb_to_ai: bool,
+
     /// AWARE-003 — AI cursor orb sprite. Replaces the default Adwaita
     /// arrow / chromium's wl_pointer.set_cursor sprite for the ai_pointer
     /// rendered into the kiosk framebuffer. Generated once at AnvilState
@@ -1098,6 +1107,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             ai_pointer,
             drive_mode: None,
             drive_mode_target: None,
+            drive_kb_to_ai: false,
             ai_cursor_orb: build_ai_cursor_orb(),
             clock,
 
