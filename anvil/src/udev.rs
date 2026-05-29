@@ -565,12 +565,48 @@ pub fn run_udev() {
 
     let ai_socket = state.ensure_workspace_socket(ai_ws);
 
-    // AI workspace kiosk — loads xpra's HTML5 client (served by `xpra start :100
-    // --bind-tcp=127.0.0.1:14501 --html=/amia/agency/xpra/launcher`). This is
-    // what cpit's DriveMode views via DMA-BUF; clicks forwarded through cpit's
-    // xpra unix-socket client appear at the xpra Xvfb behind this canvas.
-    // XPRA-006 (2026-05-26) — was http://127.0.0.1:9100/wallpaper (guide-server
-    // wallpaper page); routed to xpra-html5 per xpra.json operations.architecture.
+    // BOOT-006: greeter mode — host ONLY the iced greeter, skip the desktop.
+    // amia-greeter talks to greetd (StartSession /usr/local/bin/start) then exits;
+    // compstr::greeter flips `running` so anvil quits and greetd starts the session.
+    if compstr::greeter::is_greeter_mode() {
+        if let Some(ref socket_name) = state.socket_name {
+            compstr::greeter::run(state.running.clone(), socket_name);
+        }
+    } else {
+
+    // AGENCY-DESKTOP-UNIFICATION-003 (2026-05-28) — HUMAN workspace daedalOS kiosk
+    // spawns FIRST so it wins the xdg-decoration race + reaches anvil's
+    // deterministic xdg.rs:904 commit-path SSD-skip (compstr::desktop_kiosk
+    // recognizes wm_class=manji.desktop) before any sibling xdg_toplevel
+    // competes for compositor airtime. The AI kiosk spawn that follows is
+    // unchanged. Per CEO amendment 2026-05-28: 'not dual decorationless
+    // kiosks? just one is fine in the human workspace'. Wallpaper rendering
+    // happens inside this daedal kiosk; Console drives the wallpaperImage
+    // value via /consoleapi/desktop/session POST + SSE; daedal's
+    // session-bridge.js subscribes and applies live.
+    if let Some(ref socket_name) = state.socket_name {
+        match std::process::Command::new("chromium")
+            .args(&[
+                "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
+                "--enable-features=UseOzonePlatform", "--ozone-platform=wayland",
+                "--remote-debugging-port=9223",
+                "--class=manji.desktop",
+                "--user-data-dir=/var/kiosk/desktop",
+                "--app=http://127.0.0.1:9100/desktop",
+            ])
+            .env("WAYLAND_DISPLAY", socket_name)
+            .spawn()
+        {
+            Ok(child) => info!("Spawned human-workspace daedal kiosk (pid {}) via {} — AGENCY-DESKTOP-UNIFICATION-003", child.id(), socket_name),
+            Err(e) => error!("Failed to spawn human-workspace daedal kiosk: {}", e),
+        }
+    }
+
+    // AI workspace kiosk — loads guide-server's /ai_desktop (widgets.html,
+    // brand-styled 'amiaOS AI workspace'). UNCHANGED in AGENCY-DESKTOP-
+    // UNIFICATION-003. Cpit's DriveMode mirrors this kiosk via DMA-BUF.
+    // XPRA-008 input bridge (anvil's parallel ai_pointer/ai_seat dispatch)
+    // routes human input to this kiosk's DOM during drive mode.
     match std::process::Command::new("chromium")
         .args(&[
             "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
@@ -585,37 +621,6 @@ pub fn run_udev() {
     {
         Ok(child) => info!("Spawned AI workspace Chromium kiosk (pid {}) on workspace {} via {}", child.id(), ai_ws, ai_socket),
         Err(e) => error!("Failed to spawn AI workspace Chromium kiosk: {}", e),
-    }
-
-    // DESKTOP-NOOP-2026-05-27 — daedal kiosk spawn temp-disabled by CC per CEO
-    // direction (focus on other parts of system). To re-enable: change the
-    // `if false {` below back to `if let Some(ref socket_name) = state.socket_name {`
-    // (and remove the `let _ = socket_name_unused;` no-op line + matching outer
-    // brace). See /amia/agency/GUIde/desktop/audit.json#DESKTOP-NOOP-2026-05-27
-    // for full revert instructions + when-to-undo.
-    //
-    // Human workspace daedalOS kiosk — full desktop UI at /, borderless under topbar.
-    // Spawned on the main socket so cpit (topbar/sidebar) + this kiosk share the
-    // human-visible Wayland surface. Borderless suppression: compstr::desktop_kiosk
-    // recognizes wm_class=manji.desktop in xdg.rs ack_configure SSD-skip path.
-    if false {
-        if let Some(ref socket_name) = state.socket_name {
-            match std::process::Command::new("chromium")
-                .args(&[
-                    "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
-                    "--enable-features=UseOzonePlatform", "--ozone-platform=wayland",
-                    "--remote-debugging-port=9223",
-                    "--class=manji.desktop",
-                    "--user-data-dir=/var/kiosk/desktop",
-                    "--app=http://127.0.0.1:9100/",
-                ])
-                .env("WAYLAND_DISPLAY", socket_name)
-                .spawn()
-            {
-                Ok(child) => info!("Spawned human-workspace daedal kiosk (pid {}) via {}", child.id(), socket_name),
-                Err(e) => error!("Failed to spawn human-workspace daedal kiosk: {}", e),
-            }
-        }
     }
 
     // Supervised compilr daemon — waits for CDP, restarts on crash
@@ -639,6 +644,7 @@ pub fn run_udev() {
             }
         }
     }
+    } // BOOT-006: end greeter-mode else (desktop spawns)
 
     while state.running.load(Ordering::SeqCst) {
         let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
