@@ -572,35 +572,28 @@ pub fn run_udev() {
         if let Some(ref socket_name) = state.socket_name {
             compstr::greeter::run(state.running.clone(), socket_name);
         }
+        // BOOT-006 P_LIGHT: greeter-mode render heartbeat (thin hook; policy in
+        // compstr::greeter). A lone idle greeter yields no damage, so anvil's
+        // render loop stalls and eDP-1 never lights on spawn. Beat an
+        // unconditional render at the greeter cadence to bootstrap iced's first
+        // frame + keep page-flips alive (DPMS). Greeter-mode only; additive.
+        let hb = compstr::greeter::render_heartbeat_interval();
+        let _ = state.handle.insert_source(Timer::from_duration(hb), move |_, _, data| {
+            let nodes: Vec<_> = data.backend_data.backends.keys().copied().collect();
+            for node in nodes { data.render(node, None, data.clock.now()); }
+            TimeoutAction::ToDuration(hb)
+        });
     } else {
 
-    // AGENCY-DESKTOP-UNIFICATION-003 (2026-05-28) — HUMAN workspace daedalOS kiosk
-    // spawns FIRST so it wins the xdg-decoration race + reaches anvil's
-    // deterministic xdg.rs:904 commit-path SSD-skip (compstr::desktop_kiosk
-    // recognizes wm_class=manji.desktop) before any sibling xdg_toplevel
-    // competes for compositor airtime. The AI kiosk spawn that follows is
-    // unchanged. Per CEO amendment 2026-05-28: 'not dual decorationless
-    // kiosks? just one is fine in the human workspace'. Wallpaper rendering
-    // happens inside this daedal kiosk; Console drives the wallpaperImage
-    // value via /consoleapi/desktop/session POST + SSE; daedal's
-    // session-bridge.js subscribes and applies live.
-    if let Some(ref socket_name) = state.socket_name {
-        match std::process::Command::new("chromium")
-            .args(&[
-                "--kiosk", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
-                "--enable-features=UseOzonePlatform", "--ozone-platform=wayland",
-                "--remote-debugging-port=9223",
-                "--class=manji.desktop",
-                "--user-data-dir=/var/kiosk/desktop",
-                "--app=http://127.0.0.1:9100/desktop",
-            ])
-            .env("WAYLAND_DISPLAY", socket_name)
-            .spawn()
-        {
-            Ok(child) => info!("Spawned human-workspace daedal kiosk (pid {}) via {} — AGENCY-DESKTOP-UNIFICATION-003", child.id(), socket_name),
-            Err(e) => error!("Failed to spawn human-workspace daedal kiosk: {}", e),
-        }
-    }
+    // DESKTOP-012 (2026-05-31) — HUMAN-workspace daedal kiosk spawn REMOVED.
+    // Daedal is deprecated as the local desktop and is now a cloud-only feature:
+    // the manji.ai dashboard reaches this device's /desktop route over the
+    // per-UUID Cloudflare tunnel (guide-server still serves
+    // http://127.0.0.1:9100/desktop — only the on-boot decorationless chromium
+    // kiosk is gone). The native human desktop (an iced backdrop pinned to
+    // anvil's back layer) is the planned replacement, tracked as a follow-on.
+    // The AI-workspace kiosk below (/ai_desktop) is unchanged.
+    // Supersedes AGENCY-DESKTOP-UNIFICATION-003 + DESKTOP-NOOP-2026-05-27-V2.
 
     // AI workspace kiosk — loads guide-server's /ai_desktop (widgets.html,
     // brand-styled 'amiaOS AI workspace'). UNCHANGED in AGENCY-DESKTOP-
@@ -1163,7 +1156,7 @@ impl AnvilState<UdevData> {
                     Ok(())
                 },
                 move |size| intermediate_allocator
-                    .create_buffer(size.w as u32, size.h as u32, Fourcc::Argb8888, &[Modifier::Invalid])
+                    .create_buffer(size.w as u32, size.h as u32, Fourcc::Argb8888, &[Modifier::Linear])
                     .map_err(|e| compstr::axis::AttachError::DrmInit(format!("intermediate alloc: {e}")))
                     .and_then(|b| b.export().map_err(|e| compstr::axis::AttachError::DrmInit(format!("intermediate export: {e}")))),
             );
@@ -1595,6 +1588,22 @@ impl AnvilState<UdevData> {
         // evidence emerges, formalize inside axis as a follow-on scope.
         let render_ws_id = self.workspaces.workspace_for_output(&output).unwrap_or(0);
         let space = self.workspaces.get_space(render_ws_id).unwrap_or_else(|| self.workspaces.space());
+
+        // COMPSTR-HDMI-CLONE-001: if this head is a clone target (a non-eDP head
+        // while an eDP source is attached), source its element list from the eDP
+        // head's live surfaces (the Space eDP renders) instead of this head's own
+        // empty connector-workspace Space. Policy in compstr::axis; eDP's own pass
+        // is unchanged. Owned Output -> no axis borrow lingers into &mut self.axis.
+        let clone_src_output = self.axis.clone_source_output_for(&output);
+        let clone_source = clone_src_output.as_ref().map(|edp| {
+            let edp_ws = self.workspaces.workspace_for_output(edp).unwrap_or(0);
+            let edp_space = self
+                .workspaces
+                .get_space(edp_ws)
+                .unwrap_or_else(|| self.workspaces.space());
+            (edp, edp_space)
+        });
+
         let pointer_loc = self.human_pointer.current_location();
         let cursor_status = &mut self.cursor_status;
         let result = render_surface(
@@ -1609,6 +1618,7 @@ impl AnvilState<UdevData> {
             cursor_status,
             self.show_window_preview,
             self.snap_preview.as_ref(),
+            clone_source,
             &mut self.axis,
         );
 
@@ -1637,6 +1647,20 @@ impl AnvilState<UdevData> {
                 &output,
                 pending,
             );
+        }
+
+        // COMPSTR-DRIVE-PRESENT-002 (adaptive): keep the AI virtual output sized
+        // to the HUMAN's physical head (render_ws_id == 0) so drive mode is 1:1 —
+        // drive_scale collapses to identity (drishti dead-center on the cursor,
+        // clicks land true), no aspect distortion, AI renders at the panel's
+        // native res + refresh. Idempotent; only acts on a mode mismatch.
+        if render_ws_id == 0 {
+            if let Some(mode) = output.current_mode() {
+                if self.export.needs_resize(mode.size) {
+                    self.export.set_mode(mode);
+                    self.backend_data.export_buffers = [None, None];
+                }
+            }
         }
 
         // Offscreen export for cockpit pipeline — DMA-BUF double-buffer + unix socket
@@ -1687,6 +1711,17 @@ impl AnvilState<UdevData> {
                 }
             }
         }
+
+        // COMPSTR-DRIVE-PRESENT-002: hand the last-completed AI buffer to axis so
+        // the next render_surface presents it directly on the head. Cleared when
+        // drive mode is off. Does NOT touch the export pipeline, so the kiosk's
+        // frame callbacks are unaffected; presentable_dmabuf persists across
+        // throttled frames so the AI keeps showing between export ticks.
+        self.axis.set_drive_present(if self.drive_mode.is_some() {
+            self.export.presentable_dmabuf().cloned()
+        } else {
+            None
+        });
 
         let reschedule = match result {
             Ok((has_rendered, states)) => {
@@ -1770,6 +1805,10 @@ fn render_surface<'a>(
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
     snap_preview: Option<&crate::shell::snap::SnapPreview>,
+    // COMPSTR-HDMI-CLONE-001: when Some((src_output, src_space)) this head is a
+    // clone target — paint the source head's live surfaces here, letterboxed,
+    // instead of this head's own Space. Resolution (policy) lives in compstr::axis.
+    clone_source: Option<(&Output, &Space<WindowElement>)>,
     axis: &mut compstr::axis::Axis,
 ) -> Result<(bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
@@ -1861,9 +1900,60 @@ fn render_surface<'a>(
         custom_elements.push(CustomRenderElements::Fps(element.clone()));
     }
 
-    let (mut elements, clear_color) =
-        output_elements(output, space, custom_elements, renderer, show_window_preview);
-    axis.prepend_mirror_if_target(output, renderer, &mut elements);
+    let custom_count = custom_elements.len();
+    let (mut elements, clear_color) = if let Some((src_output, src_space)) = clone_source {
+        // COMPSTR-HDMI-CLONE-001: clone target. Paint the SOURCE head's live surface
+        // set here, letterboxed, with this head's own cursor on top. The old blit
+        // prepend (prepend_mirror_if_target) is intentionally bypassed — it is the
+        // failed import_dmabuf path (BLIT-002). Clear to opaque black for the bars.
+        let mut els: Vec<crate::render::OutputRenderElements<_, _>> = custom_elements
+            .into_iter()
+            .map(crate::render::OutputRenderElements::from)
+            .collect();
+        els.extend(crate::render::clone_space_elements(
+            renderer, src_space, src_output, output,
+        ));
+        (
+            els,
+            smithay::backend::renderer::Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )
+    } else {
+        let (mut els, color) =
+            output_elements(output, space, custom_elements, renderer, show_window_preview);
+        axis.prepend_mirror_if_target(output, renderer, &mut els);
+        (els, color)
+    };
+
+    // COMPSTR-DRIVE-PRESENT-002: in drive mode present the AI export buffer
+    // DIRECTLY on this head, killing the cpit DMA-BUF return trip from the
+    // VISIBLE path (typed-text feedback lagged on that trip; the cursor felt
+    // fast only because it's a hardware plane that bypasses it). output_elements'
+    // space list is z-sorted front->back: overlay, top, windows, bottom,
+    // background. Insert the full-screen AI element just in front of the Bottom
+    // layer (after custom + overlay/top layers + windows) so it fills the screen
+    // below the taskbar/windows and covers cpit's higher-latency quad. Reuses the
+    // Mirror enum variant (same TextureRenderElement type; a second variant of
+    // that type would make a conflicting From impl). The export pipeline is
+    // untouched, so the kiosk's frame callbacks keep flowing (invariant holds).
+    if let Some(dmabuf) = axis.drive_present_dmabuf() {
+        if let Some(drive_el) = compstr::drive::kiosk_element(renderer, dmabuf, output) {
+            let front_layers = {
+                let map = smithay::desktop::layer_map_for_output(output);
+                map.layers()
+                    .filter(|l| {
+                        matches!(
+                            l.layer(),
+                            smithay::wayland::shell::wlr_layer::Layer::Overlay
+                                | smithay::wayland::shell::wlr_layer::Layer::Top
+                        )
+                    })
+                    .count()
+            };
+            let windows = space.elements_for_output(output).count();
+            let idx = (custom_count + front_layers + windows).min(elements.len());
+            elements.insert(idx, crate::render::OutputRenderElements::Mirror(drive_el));
+        }
+    }
 
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()

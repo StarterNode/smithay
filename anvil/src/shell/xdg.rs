@@ -902,6 +902,16 @@ fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface)
     })
     .unwrap_or_default();
     if compstr::desktop_kiosk::is_desktop_kiosk(&app_id) {
+        // AGENCY-DESKTOP-UNIFICATION-003 (2026-05-28) — skip the deterministic
+        // restore when the kiosk is intentionally minimized via wlr-foreign-
+        // toplevel-management (e.g. cpit's drive-mode engage hiding daedal).
+        // Without this guard, every chromium commit re-maps the kiosk to
+        // output geometry, undoing the minimize within microseconds.
+        let is_min = window
+            .0
+            .toplevel()
+            .map(|t| compstr::minimize::is_minimized(t))
+            .unwrap_or(false);
         // Bind to a `let` first so the immutable borrow from outputs()/output_geometry()
         // ends here (Rectangle is Copy) and does not outlive into the map_element() below.
         let output_geo = space.outputs().next().and_then(|o| space.output_geometry(o));
@@ -910,7 +920,7 @@ fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface)
                 .element_geometry(&window)
                 .map(|r| r.loc == geo.loc && r.size == geo.size)
                 .unwrap_or(false);
-            if !settled {
+            if !settled && !is_min {
                 if let Some(toplevel) = window.0.toplevel() {
                     toplevel.with_pending_state(|state| {
                         state.states.set(xdg_toplevel::State::Fullscreen);

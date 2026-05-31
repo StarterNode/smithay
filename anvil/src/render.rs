@@ -60,6 +60,7 @@ smithay::backend::renderer::element::render_elements! {
     Custom=CustomRenderElements<R>,
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
     Mirror=smithay::backend::renderer::element::texture::TextureRenderElement<<R as smithay::backend::renderer::RendererSuper>::TextureId>,
+    HeadClone=RelocateRenderElement<RescaleRenderElement<SpaceRenderElements<R, E>>>,
 }
 
 impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug> std::fmt::Debug
@@ -72,6 +73,7 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Custom(arg0) => f.debug_tuple("Custom").field(arg0).finish(),
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
             Self::Mirror(arg0) => f.debug_tuple("Mirror").field(arg0).finish(),
+            Self::HeadClone(arg0) => f.debug_tuple("HeadClone").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -194,6 +196,60 @@ where
 
         (output_render_elements, CLEAR_COLOR)
     }
+}
+
+/// COMPSTR-HDMI-CLONE-001: build a render-element list that CLONES `src_output`'s
+/// LIVE surface set (windows + layer-shell — i.e. cpit's taskbar/viewport + ws0's
+/// daedal/kiosk) onto `dst_output`, aspect-preserved and centered (letterbox).
+///
+/// This is the NON-blit path: it re-renders the SAME live wl_surfaces with the SAME
+/// renderer that drew them on the source head — it never moves a finished buffer
+/// between outputs, so it cannot hit the import_dmabuf `Error::DeviceMissing` that
+/// killed the blit (BLIT-002). The fit (uniform scale + centering offset) comes from
+/// `compstr::clone::letterbox`; the wrappers forward the inner element id/commit, so
+/// `dst_output`'s own damage tracker repaints when the source surfaces commit. The
+/// caller clears `dst_output` to opaque black so the letterbox bars are solid.
+pub fn clone_space_elements<R>(
+    renderer: &mut R,
+    src_space: &Space<WindowElement>,
+    src_output: &Output,
+    dst_output: &Output,
+) -> Vec<OutputRenderElements<R, WindowRenderElement<R>>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Send + 'static,
+{
+    use smithay::backend::renderer::element::utils::Relocate;
+    use smithay::utils::Scale;
+
+    let src_size = src_output.current_mode().map(|m| m.size).unwrap_or_default();
+    let dst_size = dst_output.current_mode().map(|m| m.size).unwrap_or_default();
+    if src_size.w == 0 || src_size.h == 0 || dst_size.w == 0 || dst_size.h == 0 {
+        return Vec::new();
+    }
+
+    let fit = compstr::clone::letterbox(src_size, dst_size);
+
+    let space_elements = smithay::desktop::space::space_render_elements::<_, WindowElement, _>(
+        renderer,
+        [src_space],
+        src_output,
+        1.0,
+    )
+    .expect("clone: source output without mode?");
+
+    space_elements
+        .into_iter()
+        .map(|e| {
+            // Scale each source element about the source top-left (0,0), then offset
+            // it into the centered letterbox rectangle on the destination head.
+            let scaled =
+                RescaleRenderElement::from_element(e, Point::from((0, 0)), Scale::from(fit.scale));
+            let placed =
+                RelocateRenderElement::from_element(scaled, fit.offset, Relocate::Relative);
+            OutputRenderElements::HeadClone(placed)
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
