@@ -1654,7 +1654,7 @@ impl AnvilState<UdevData> {
         // drive_scale collapses to identity (drishti dead-center on the cursor,
         // clicks land true), no aspect distortion, AI renders at the panel's
         // native res + refresh. Idempotent; only acts on a mode mismatch.
-        if render_ws_id == 0 {
+        if render_ws_id == 0 && clone_src_output.is_none() {
             if let Some(mode) = output.current_mode() {
                 if self.export.needs_resize(mode.size) {
                     self.export.set_mode(mode);
