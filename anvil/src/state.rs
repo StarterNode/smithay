@@ -160,6 +160,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     // (orb factory defined at module bottom; field initialized in constructor)
     pub axis: compstr::axis::Axis,
     pub mirror: crate::workspace::MirrorState,
+    // CONTROLR-003 — controlr's human-input aggregate (anvil-rendered right-click
+    // menu + future selection). Thin hook; all logic lives in the controlr crate.
+    pub controlr: controlr::Controlr,
     pub export: crate::workspace::ExportState,
     pub xwayland_rootful: crate::workspace::XwaylandRootful,
     pub cockpit_socket: compstr::socket::CockpitSocket,
@@ -1066,6 +1069,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             workspaces: crate::workspace::WorkspaceManager::new(),
             axis: compstr::axis::Axis::new(),
             mirror: crate::workspace::MirrorState::new(),
+            controlr: controlr::Controlr::new(),
             export,
             xwayland_rootful,
             cockpit_socket: compstr::socket::CockpitSocket::new(),

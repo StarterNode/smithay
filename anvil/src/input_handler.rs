@@ -258,6 +258,87 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         action
     }
 
+    // ===== CONTROLR-003 thin-hook helpers =====
+    // The menu logic lives in the controlr crate; anvil performs only the
+    // privileged half (key synthesis needs &mut Self; spawn reuses the Run path).
+
+    /// Apply a verdict the controlr menu returned for a consumed event.
+    fn apply_controlr_verdict(&mut self, v: controlr::Verdict, time: u32) {
+        match v {
+            controlr::Verdict::Consumed => {}
+            controlr::Verdict::Effect(controlr::Effect::SynthCopy) => {
+                self.controlr_synth_ctrl(46, time) // evdev KEY_C
+            }
+            controlr::Verdict::Effect(controlr::Effect::SynthPaste) => {
+                self.controlr_synth_ctrl(47, time) // evdev KEY_V
+            }
+            controlr::Verdict::Effect(controlr::Effect::Spawn(cmd)) => self.controlr_spawn(cmd),
+        }
+    }
+
+    /// Synthesize Ctrl+<key> (evdev LEFTCTRL=29) to the focused keyboard so the
+    /// menu's Copy/Paste reach the focused client. Per-app native Ctrl+C/V are
+    /// untouched — this only fires from a menu activation.
+    fn controlr_synth_ctrl(&mut self, key: u32, time: u32) {
+        let Some(kb) = self.active_seat().get_keyboard() else {
+            return;
+        };
+        for (code, st) in [
+            (29u32, KeyState::Pressed),
+            (key, KeyState::Pressed),
+            (key, KeyState::Released),
+            (29u32, KeyState::Released),
+        ] {
+            kb.input::<(), _>(
+                self,
+                Keycode::from(code),
+                st,
+                SCOUNTER.next_serial(),
+                time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+    }
+
+    /// Spawn a helper by command name (menu Screenshot items). Same env as Run.
+    fn controlr_spawn(&mut self, cmd: &str) {
+        let mut c = Command::new(cmd);
+        if let Some(sock) = self.socket_name.clone() {
+            c.env("WAYLAND_DISPLAY", sock);
+        }
+        if let Err(e) = c.spawn() {
+            error!(cmd, err = %e, "controlr: spawn failed");
+        }
+    }
+
+    /// Logical size + scale of the output the menu anchors within (first output;
+    /// single-head on the prototype — multi-head refinement is a watch-item).
+    fn controlr_output_geom(&self) -> (f64, f64, f64) {
+        let space = self.workspaces.space();
+        if let Some(o) = space.outputs().next() {
+            let scale = o.current_scale().fractional_scale();
+            if let Some(m) = o.current_mode() {
+                let size = m.size.to_f64().to_logical(scale);
+                return (size.w, size.h, scale);
+            }
+        }
+        (1920.0, 1200.0, 1.0)
+    }
+
+    /// app_id of the toplevel under `loc`, or None when over the backdrop (no
+    /// toplevel) — None is treated as native/eligible by controlr.
+    fn controlr_focused_app_id(&self, loc: Point<f64, Logical>) -> Option<String> {
+        let (window, _) = self.workspaces.space().element_under(loc)?;
+        let surface = window.wl_surface()?;
+        smithay::wayland::compositor::with_states(&surface, |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok())
+                .and_then(|g| g.app_id.clone())
+        })
+    }
+
     fn on_pointer_button<B: InputBackend>(&mut self, evt: B::PointerButtonEvent) {
         let serial = SCOUNTER.next_serial();
         let button = evt.button_code();
@@ -265,10 +346,47 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let state = wl_pointer::ButtonState::from(evt.state());
 
         let pointer = self.active_pointer();
+        let ploc = pointer.current_location();
+        let pressed = wl_pointer::ButtonState::Pressed == state;
 
-        if wl_pointer::ButtonState::Pressed == state {
-            self.update_keyboard_focus(pointer.current_location(), serial);
+        // CONTROLR-003: while the anvil-rendered right-click menu is open it owns
+        // pointer buttons (modal). controlr decides; anvil applies the verdict.
+        if self.controlr.menu_open() {
+            if let Some(v) =
+                self.controlr
+                    .on_pointer_button(button, pressed, ploc.x, ploc.y, 0.0, 0.0, 1.0, None)
+            {
+                self.apply_controlr_verdict(v, evt.time_msec());
+                pointer.frame(self);
+                return;
+            }
+        }
+
+        if pressed {
+            self.update_keyboard_focus(ploc, serial);
         };
+
+        // CONTROLR-003: open the menu on a right-press over an eligible (native iced
+        // or backdrop) surface — AFTER focus moved to it, so Copy/Paste synthesis
+        // targets that client. Foreign/web surfaces pass through (own menu).
+        if pressed && button == 0x111 {
+            let (ow, oh, oscale) = self.controlr_output_geom();
+            let app_id = self.controlr_focused_app_id(ploc);
+            if let Some(v) = self.controlr.on_pointer_button(
+                button,
+                pressed,
+                ploc.x,
+                ploc.y,
+                ow,
+                oh,
+                oscale,
+                app_id.as_deref(),
+            ) {
+                self.apply_controlr_verdict(v, evt.time_msec());
+                pointer.frame(self);
+                return;
+            }
+        }
 
         // XPRA-008 bridge: in drive mode, ALSO dispatch button event via ai_pointer
         // to chromium kiosk's wl_surface (kiosk on ws_ai only sees the AI seat).
@@ -996,6 +1114,12 @@ impl AnvilState<UdevData> {
                     }
                 }
             }
+        }
+
+        // CONTROLR-003: update the menu hover highlight (non-consuming — the cursor
+        // still moves normally so motion never freezes while the menu is up).
+        if self.controlr.menu_open() {
+            self.controlr.on_pointer_motion(pointer_location.x, pointer_location.y);
         }
 
         pointer.motion(

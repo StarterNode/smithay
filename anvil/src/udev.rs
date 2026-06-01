@@ -1641,6 +1641,7 @@ impl AnvilState<UdevData> {
             clone_source,
             ai_present,
             &mut self.axis,
+            &mut self.controlr,
         );
 
         // Process pending mirror frames for AI workspaces (ext-image-copy-capture clients)
@@ -1836,6 +1837,9 @@ fn render_surface<'a>(
     // replacing the old export-DMA-BUF drive quad. Resolution lives in the caller.
     ai_present: Option<(&Space<WindowElement>, &Output, Point<f64, Logical>)>,
     axis: &mut compstr::axis::Axis,
+    // CONTROLR-003: controlr's input aggregate — its render_elements() yields the
+    // right-click menu overlay (empty when the menu is closed).
+    controlr: &mut controlr::Controlr,
 ) -> Result<(bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -1987,6 +1991,22 @@ fn render_surface<'a>(
             let idx = (custom_count + front_layers + windows).min(elements.len());
             elements.splice(idx..idx, present_els);
         }
+    }
+
+    // CONTROLR-003: composite the anvil-rendered right-click menu just below the
+    // cursor (custom_count) and above windows/layers. Reuses the AiCursor enum
+    // variant — both are MemoryRenderBufferRenderElement<R>, and a second variant
+    // of that type would create a conflicting From impl (same reasoning as the
+    // Mirror-variant reuse for drive-present above).
+    let menu_els = controlr.render_elements(renderer);
+    if !menu_els.is_empty() {
+        let idx = custom_count.min(elements.len());
+        elements.splice(
+            idx..idx,
+            menu_els
+                .into_iter()
+                .map(crate::render::OutputRenderElements::AiCursor),
+        );
     }
 
     let frame_mode = if surface.disable_direct_scanout {
