@@ -2009,6 +2009,20 @@ fn render_surface<'a>(
         );
     }
 
+    // CONTROLR-005: composite the backdrop rubber-band rectangle (active only
+    // during a drag) on top, via the dedicated Selection (SolidColorRenderElement)
+    // variant.
+    let sel_els = controlr.selection_elements(output.current_scale().fractional_scale());
+    if !sel_els.is_empty() {
+        let idx = custom_count.min(elements.len());
+        elements.splice(
+            idx..idx,
+            sel_els
+                .into_iter()
+                .map(crate::render::OutputRenderElements::Selection),
+        );
+    }
+
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()
     } else {

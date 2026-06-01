@@ -388,6 +388,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
         }
 
+        // CONTROLR-005: backdrop rubber-band. A left-press over the backdrop (no
+        // toplevel under the pointer) arms a drag; the press itself is never
+        // consumed (a plain click still works), but the release that ends a real
+        // drag is consumed and the region reported to the backdrop.
+        if button == 0x110 {
+            let on_backdrop = self.workspaces.space().element_under(ploc).is_none();
+            if self.controlr.on_left_button(pressed, ploc.x, ploc.y, on_backdrop) {
+                pointer.frame(self);
+                return;
+            }
+        }
+
         // XPRA-008 bridge: in drive mode, ALSO dispatch button event via ai_pointer
         // to chromium kiosk's wl_surface (kiosk on ws_ai only sees the AI seat).
         // human_pointer dispatches as normal — events to ws_ai surfaces from human
@@ -1116,9 +1128,9 @@ impl AnvilState<UdevData> {
             }
         }
 
-        // CONTROLR-003: update the menu hover highlight (non-consuming — the cursor
-        // still moves normally so motion never freezes while the menu is up).
-        if self.controlr.menu_open() {
+        // CONTROLR-003/005: drive the menu hover highlight + the backdrop rubber-band
+        // (non-consuming — the cursor still moves normally, never frozen).
+        if self.controlr.wants_motion() {
             self.controlr.on_pointer_motion(pointer_location.x, pointer_location.y);
         }
 
