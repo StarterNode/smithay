@@ -627,7 +627,7 @@ pub fn run_udev() {
 
     // Spawn panels — they inherit WAYLAND_DISPLAY from env
     if let Some(ref socket_name) = state.socket_name {
-        for panel in &["/usr/local/bin/cpit"] {
+        for panel in &["/usr/local/bin/gui/backdrop", "/usr/local/bin/cpit"] {
             match std::process::Command::new(panel)
                 .env("WAYLAND_DISPLAY", socket_name)
                 .spawn()
@@ -1604,6 +1604,26 @@ impl AnvilState<UdevData> {
             (edp, edp_space)
         });
 
+        // COMPSTR-004-AI-WORKSPACE-DIRECT-PRESENT: resolve the AI-workspace present
+        // for the physical head when the peacock is engaged (drive_mode = Some(ai_ws)).
+        // Only on the real eDP head (render_ws_id == 0), never on a clone target.
+        // Disjoint borrows: self.workspaces (shared, also held by `space`),
+        // self.xwayland_rootful (shared), self.ai_pointer (owned location); the call
+        // also takes &mut self.axis, a separate field, so there is no borrow conflict.
+        let ai_present = if render_ws_id == 0 && clone_src_output.is_none() {
+            self.drive_mode.and_then(|ai_id| {
+                self.workspaces.get_space(ai_id).map(|ai_space| {
+                    (
+                        ai_space,
+                        self.xwayland_rootful.output(),
+                        self.ai_pointer.current_location(),
+                    )
+                })
+            })
+        } else {
+            None
+        };
+
         let pointer_loc = self.human_pointer.current_location();
         let cursor_status = &mut self.cursor_status;
         let result = render_surface(
@@ -1619,6 +1639,7 @@ impl AnvilState<UdevData> {
             self.show_window_preview,
             self.snap_preview.as_ref(),
             clone_source,
+            ai_present,
             &mut self.axis,
         );
 
@@ -1809,6 +1830,11 @@ fn render_surface<'a>(
     // clone target — paint the source head's live surfaces here, letterboxed,
     // instead of this head's own Space. Resolution (policy) lives in compstr::axis.
     clone_source: Option<(&Output, &Space<WindowElement>)>,
+    // COMPSTR-004-AI-WORKSPACE-DIRECT-PRESENT: when Some((ai_space, ai_output, ai_pos))
+    // the peacock is engaged on this physical head — present the AI workspace's LIVE
+    // surfaces (Xwayland-rootful chromium) directly here (B-live), drishti on top,
+    // replacing the old export-DMA-BUF drive quad. Resolution lives in the caller.
+    ai_present: Option<(&Space<WindowElement>, &Output, Point<f64, Logical>)>,
     axis: &mut compstr::axis::Axis,
 ) -> Result<(bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
@@ -1935,8 +1961,16 @@ fn render_surface<'a>(
     // Mirror enum variant (same TextureRenderElement type; a second variant of
     // that type would make a conflicting From impl). The export pipeline is
     // untouched, so the kiosk's frame callbacks keep flowing (invariant holds).
-    if let Some(dmabuf) = axis.drive_present_dmabuf() {
-        if let Some(drive_el) = compstr::drive::kiosk_element(renderer, dmabuf, output) {
+    // COMPSTR-004-AI-WORKSPACE-DIRECT-PRESENT: B-live present. When the peacock is
+    // engaged, paint the AI workspace's LIVE surfaces directly on this head (no
+    // export DMA-BUF, no cpit quad) with the drishti on top, inserted just in front
+    // of the Bottom layer (below the taskbar/windows) — exactly where the old export
+    // drive quad sat. (The old `axis.drive_present_dmabuf()` / compstr::drive path is
+    // superseded here; the now-dead export stash + drive.rs are removed in P2.)
+    if let Some((ai_space, ai_output, ai_pos)) = ai_present {
+        let present_els =
+            crate::render::present_ai_elements(renderer, ai_space, ai_output, output, ai_pos);
+        if !present_els.is_empty() {
             let front_layers = {
                 let map = smithay::desktop::layer_map_for_output(output);
                 map.layers()
@@ -1951,7 +1985,7 @@ fn render_surface<'a>(
             };
             let windows = space.elements_for_output(output).count();
             let idx = (custom_count + front_layers + windows).min(elements.len());
-            elements.insert(idx, crate::render::OutputRenderElements::Mirror(drive_el));
+            elements.splice(idx..idx, present_els);
         }
     }
 

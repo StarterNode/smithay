@@ -61,6 +61,7 @@ smithay::backend::renderer::element::render_elements! {
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
     Mirror=smithay::backend::renderer::element::texture::TextureRenderElement<<R as smithay::backend::renderer::RendererSuper>::TextureId>,
     HeadClone=RelocateRenderElement<RescaleRenderElement<SpaceRenderElements<R, E>>>,
+    AiCursor=smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<R>,
 }
 
 impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug> std::fmt::Debug
@@ -74,6 +75,7 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
             Self::Mirror(arg0) => f.debug_tuple("Mirror").field(arg0).finish(),
             Self::HeadClone(arg0) => f.debug_tuple("HeadClone").field(arg0).finish(),
+            Self::AiCursor(arg0) => f.debug_tuple("AiCursor").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -250,6 +252,57 @@ where
             OutputRenderElements::HeadClone(placed)
         })
         .collect()
+}
+
+/// COMPSTR-004-AI-WORKSPACE-DIRECT-PRESENT: present the AI workspace's LIVE
+/// surfaces (the Xwayland-rootful chromium kiosk) DIRECTLY on `dst_output`
+/// (eDP-1) on the peacock toggle, with the drishti AI cursor on top.
+///
+/// This is the B-live path: it re-renders the AI space's wl_surfaces with the
+/// SAME renderer (no export DMA-BUF, no cpit quad). It reuses `clone_space_elements`
+/// for the surfaces, so when `ai_output`'s mode == `dst_output`'s mode the fit
+/// collapses to identity (fullscreen 1:1) and the human pointer lands on the
+/// surface at true coords. The drishti rides on top at the AI pointer position
+/// (identity/1:1 placement — AI-space logical coords == eDP coords at 1:1).
+pub fn present_ai_elements<R>(
+    renderer: &mut R,
+    ai_space: &Space<WindowElement>,
+    ai_output: &Output,
+    dst_output: &Output,
+    ai_pointer_pos: Point<f64, smithay::utils::Logical>,
+) -> Vec<OutputRenderElements<R, WindowRenderElement<R>>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Send + 'static,
+{
+    use compstr::screen::ai_cursor::{drishti_buffer, DRISHTI_HOTSPOT};
+    use smithay::backend::renderer::element::{memory::MemoryRenderBufferRenderElement, Kind};
+
+    let mut elements: Vec<OutputRenderElements<R, WindowRenderElement<R>>> = Vec::new();
+
+    // drishti AI cursor on top (1:1 placement; identity fit only).
+    let px = ai_pointer_pos.x.round() as i32;
+    let py = ai_pointer_pos.y.round() as i32;
+    let drishti_loc = Point::<f64, smithay::utils::Physical>::from((
+        (px - DRISHTI_HOTSPOT) as f64,
+        (py - DRISHTI_HOTSPOT) as f64,
+    ));
+    match MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        drishti_loc,
+        drishti_buffer(),
+        None,
+        None,
+        None,
+        Kind::Cursor,
+    ) {
+        Ok(sprite) => elements.push(OutputRenderElements::AiCursor(sprite)),
+        Err(e) => tracing::warn!("present: drishti buffer upload failed: {e:?}"),
+    }
+
+    // AI surfaces underneath (identity fit when ai_output mode == dst_output mode).
+    elements.extend(clone_space_elements(renderer, ai_space, ai_output, dst_output));
+    elements
 }
 
 #[allow(clippy::too_many_arguments)]
