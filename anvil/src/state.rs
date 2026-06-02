@@ -662,9 +662,9 @@ delegate_xdg_activation!(@<BackendData: Backend + 'static> AnvilState<BackendDat
 impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        // Default to client-side decorations — CSD apps draw their own, anvil draws none (ANVIL-007)
+        // ANVIL-008 (reverses ANVIL-007): default SERVER-side — anvil draws the chrome. GTK/CSD apps do not bind xdg-decoration (unaffected); explicit ClientSide requests still honored in request_mode. Also gives anvil window ordering over these toplevels. // — CSD apps draw their own, anvil draws none (ANVIL-007)
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ClientSide);
+            state.decoration_mode = Some(Mode::ServerSide);
         });
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
@@ -684,9 +684,9 @@ impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
     }
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
-        // When mode is unset, fall back to client-side (ANVIL-007)
+        // ANVIL-008: fall back to server-side
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ClientSide);
+            state.decoration_mode = Some(Mode::ServerSide);
         });
 
         if toplevel.is_initial_configure_sent() {
