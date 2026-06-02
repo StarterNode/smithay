@@ -62,7 +62,6 @@ smithay::backend::renderer::element::render_elements! {
     Mirror=smithay::backend::renderer::element::texture::TextureRenderElement<<R as smithay::backend::renderer::RendererSuper>::TextureId>,
     HeadClone=RelocateRenderElement<RescaleRenderElement<SpaceRenderElements<R, E>>>,
     AiCursor=smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<R>,
-    Selection=SolidColorRenderElement,
 }
 
 impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug> std::fmt::Debug
@@ -77,7 +76,6 @@ impl<R: Renderer + ImportAll + ImportMem, E: RenderElement<R> + std::fmt::Debug>
             Self::Mirror(arg0) => f.debug_tuple("Mirror").field(arg0).finish(),
             Self::HeadClone(arg0) => f.debug_tuple("HeadClone").field(arg0).finish(),
             Self::AiCursor(arg0) => f.debug_tuple("AiCursor").field(arg0).finish(),
-            Self::Selection(arg0) => f.debug_tuple("Selection").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }

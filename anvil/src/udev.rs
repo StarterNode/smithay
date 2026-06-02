@@ -627,7 +627,7 @@ pub fn run_udev() {
 
     // Spawn panels — they inherit WAYLAND_DISPLAY from env
     if let Some(ref socket_name) = state.socket_name {
-        for panel in &["/usr/local/bin/gui/backdrop", "/usr/local/bin/cpit"] {
+        for panel in &["/usr/local/bin/gui/backdrop", "/usr/local/bin/gui/dais"] {
             match std::process::Command::new(panel)
                 .env("WAYLAND_DISPLAY", socket_name)
                 .spawn()
@@ -2006,20 +2006,6 @@ fn render_surface<'a>(
             menu_els
                 .into_iter()
                 .map(crate::render::OutputRenderElements::AiCursor),
-        );
-    }
-
-    // CONTROLR-005: composite the backdrop rubber-band rectangle (active only
-    // during a drag) on top, via the dedicated Selection (SolidColorRenderElement)
-    // variant.
-    let sel_els = controlr.selection_elements(output.current_scale().fractional_scale());
-    if !sel_els.is_empty() {
-        let idx = custom_count.min(elements.len());
-        elements.splice(
-            idx..idx,
-            sel_els
-                .into_iter()
-                .map(crate::render::OutputRenderElements::Selection),
         );
     }
 
