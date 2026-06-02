@@ -344,7 +344,7 @@ pub fn run_x11() {
 
     // Spawn panels — they inherit WAYLAND_DISPLAY from env
     if let Some(ref socket_name) = state.socket_name {
-        for panel in &["/usr/local/bin/gui/backdrop", "/usr/local/bin/cpit"] {
+        for panel in &["/usr/local/bin/gui/backdrop", "/usr/local/bin/gui/dais"] {
             match std::process::Command::new(panel)
                 .env("WAYLAND_DISPLAY", socket_name)
                 .spawn()
