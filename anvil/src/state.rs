@@ -290,6 +290,10 @@ impl<BackendData: Backend> WaylandDndGrabHandler for AnvilState<BackendData> {
             offset: (0, 0).into(),
         });
 
+        // CONTROLR-007: capture a file drag's uri-list now (the source is still in
+        // hand) so a drop onto the desktop can land the files in ~/Desktop.
+        controlr::dnd::capture(&source);
+
         match type_ {
             GrabType::Pointer => {
                 let pointer = seat.get_pointer().unwrap();
@@ -317,12 +321,31 @@ impl<BackendData: Backend> WaylandDndGrabHandler for AnvilState<BackendData> {
 impl<BackendData: Backend> DndGrabHandler for AnvilState<BackendData> {
     fn dropped(
         &mut self,
-        _target: Option<DndTarget<'_, Self>>,
+        target: Option<DndTarget<'_, Self>>,
         _validated: bool,
         _seat: Seat<Self>,
         _location: Point<f64, Logical>,
     ) {
         self.dnd_icon = None;
+        // CONTROLR-007: a drop onto the desktop (backdrop layer surface) lands the
+        // dragged files in ~/Desktop. We use the uri-list captured at drag-start
+        // (the iced backdrop never negotiates the offer, so we don't rely on it).
+        let surface = match target {
+            Some(DndTarget::Pointer(f)) => f.wl_surface().map(|c| c.into_owned()),
+            Some(DndTarget::Touch(f)) => f.wl_surface().map(|c| c.into_owned()),
+            None => None,
+        };
+        if let Some(surface) = surface {
+            let is_backdrop = self.workspaces.space().outputs().any(|o| {
+                smithay::desktop::layer_map_for_output(o)
+                    .layers()
+                    .any(|l| l.namespace() == "amiaos-backdrop" && l.wl_surface() == &surface)
+            });
+            if is_backdrop {
+                let n = controlr::dnd::drop_to_desktop();
+                tracing::info!("controlr/dnd: dropped {n} item(s) onto the desktop");
+            }
+        }
     }
 }
 delegate_data_device!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
